@@ -32,7 +32,7 @@ INVALID_REASONS = {
     "http_5xx",
     "timeout",
 }
-_MODEL_CATALOG_CACHE: dict[tuple[str, str], dict[str, str]] = {}
+_MODEL_CATALOG_CACHE: dict[str, dict[str, str]] = {}
 _MODEL_CATALOG_LOCK: asyncio.Lock | None = None
 
 
@@ -48,11 +48,33 @@ class DecisionResult:
     invalid_reason: str | None = None
 
 
-def _gold_distribution(record: dict[str, Any]) -> dict[str, float] | None:
+def _checked_gold_distribution(
+    value: Any, labels: list[str], source: str
+) -> dict[str, float] | None:
+    if not isinstance(value, dict):
+        return None
+    distribution, invalid_reason = _validate_distribution(value, labels)
+    if invalid_reason is not None:
+        raise ValueError(f"{source} is not a valid gold distribution: {invalid_reason}")
+    return distribution
+
+
+def _gold_distribution(record: dict[str, Any], labels: list[str]) -> dict[str, float] | None:
     for key in ("gold_distribution", "expected_distribution", "distribution"):
-        value = record.get(key)
-        if isinstance(value, dict):
-            return {str(k): float(v) for k, v in value.items()}
+        distribution = _checked_gold_distribution(
+            record.get(key), labels, f"{record.get('id', '<unknown>')}.{key}"
+        )
+        if distribution is not None:
+            return distribution
+    provenance = record.get("provenance")
+    if isinstance(provenance, dict):
+        # Hard probability-family golds are scoring metadata only. They must never
+        # be rendered into the sample input or copied into public provenance.
+        return _checked_gold_distribution(
+            provenance.get("gold_probs"),
+            labels,
+            f"{record.get('id', '<unknown>')}.provenance.gold_probs",
+        )
     return None
 
 
@@ -115,7 +137,7 @@ def _sample_from_record(record: dict[str, Any]) -> Sample:
     for key in ("topic",):
         if key in record:
             metadata[key] = record[key]
-    gold_distribution = _gold_distribution(record)
+    gold_distribution = _gold_distribution(record, labels)
     if gold_distribution is not None:
         metadata["gold_distribution"] = gold_distribution
 
@@ -227,7 +249,7 @@ def _modalities_from_payload(payload: Any) -> dict[str, str]:
 async def _private_model_modalities(
     client: httpx.AsyncClient, base_url: str, api_key: str
 ) -> dict[str, str]:
-    cache_key = (base_url.rstrip("/"), f"private:{api_key}")
+    cache_key = base_url.rstrip("/")
     if cache_key in _MODEL_CATALOG_CACHE:
         return _MODEL_CATALOG_CACHE[cache_key]
 
@@ -259,33 +281,22 @@ async def _private_model_modalities(
         return modalities
 
 
+def _new_private_httpx_client(timeout_s: float) -> httpx.AsyncClient:
+    return httpx.AsyncClient(timeout=httpx.Timeout(timeout_s))
+
+
 async def _provider_model_modalities(provider_client: Any, timeout_s: float) -> dict[str, str]:
-    cache_key = (str(provider_client.base_url).rstrip("/"), f"provider:{id(provider_client)}")
-    if cache_key in _MODEL_CATALOG_CACHE:
-        return _MODEL_CATALOG_CACHE[cache_key]
-
-    global _MODEL_CATALOG_LOCK
-    if _MODEL_CATALOG_LOCK is None:
-        _MODEL_CATALOG_LOCK = asyncio.Lock()
-
-    async with _MODEL_CATALOG_LOCK:
-        if cache_key in _MODEL_CATALOG_CACHE:
-            return _MODEL_CATALOG_CACHE[cache_key]
-        try:
-            response = await provider_client.get(
-                "/models",
-                cast_to=httpx.Response,
-                options={"max_retries": 0, "timeout": timeout_s},
-            )
-            response.raise_for_status()
-            payload = response.json()
-        except Exception:
-            _MODEL_CATALOG_CACHE[cache_key] = {}
-            return {}
-
-        modalities = _modalities_from_payload(payload)
-        _MODEL_CATALOG_CACHE[cache_key] = modalities
-        return modalities
+    base_url = str(provider_client.base_url)
+    api_key = str(getattr(provider_client, "api_key", "") or "")
+    # AnyEval journals every request on Inspect's provider client as billable.
+    # Keep catalog discovery on a private httpx client; only /decide uses the
+    # provider client and its accounting hooks.
+    try:
+        async with _new_private_httpx_client(timeout_s) as client:
+            return await _private_model_modalities(client, base_url, api_key)
+    except Exception:
+        _MODEL_CATALOG_CACHE[base_url.rstrip("/")] = {}
+        return {}
 
 
 def _extract_probs(answer: dict[str, Any], qtype: str) -> dict[str, Any] | None:

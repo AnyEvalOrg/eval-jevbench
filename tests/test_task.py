@@ -7,6 +7,7 @@ import openai
 import pytest
 from inspect_ai import eval
 
+import jevbench.task as task_module
 from jevbench.task import (
     INVALID_REASONS,
     _MODEL_CATALOG_CACHE,
@@ -15,10 +16,21 @@ from jevbench.task import (
     _load_samples,
     _model_id_for_gateway,
     _openai_provider_client,
+    _private_model_modalities,
     _score_decision,
     _translate_question,
     jevbench,
 )
+
+
+def _mock_private_catalog(monkeypatch, handler):
+    def factory(timeout_s):
+        return httpx.AsyncClient(
+            timeout=httpx.Timeout(timeout_s),
+            transport=httpx.MockTransport(handler),
+        )
+
+    monkeypatch.setattr(task_module, "_new_private_httpx_client", factory)
 
 
 def test_data_loads_all_public_samples_with_exact_ids():
@@ -120,6 +132,48 @@ def test_scorer_distribution_metrics():
     assert score.metadata["ordinal_mae"] == pytest.approx(0.3)
 
 
+def test_hard_probability_gold_probs_become_private_score_metadata():
+    records = _load_records("hard")
+    gold_records = [
+        record
+        for record in records
+        if isinstance(record.get("provenance"), dict)
+        and isinstance(record["provenance"].get("gold_probs"), dict)
+    ]
+    samples = _load_samples("hard")
+    gold_samples = [sample for sample in samples if sample.metadata.get("gold_distribution") is not None]
+
+    assert len(gold_records) == 10
+    assert {sample.id for sample in gold_samples} == {record["id"] for record in gold_records}
+
+    for sample in gold_samples:
+        labels = sample.metadata["labels"]
+        gold = sample.metadata["gold_distribution"]
+        assert set(gold) == set(labels)
+        assert sum(gold.values()) == pytest.approx(1.0)
+        assert "gold_probs" not in str(sample.input)
+        assert "gold_probs" not in str(sample.metadata.get("provenance") or {})
+
+    scored = _score_decision(
+        raw_probs=gold_samples[0].metadata["gold_distribution"],
+        expected=gold_samples[0].target,
+        labels=gold_samples[0].metadata["labels"],
+        question_type=gold_samples[0].metadata["question_type"],
+        gold_distribution=gold_samples[0].metadata["gold_distribution"],
+    )
+    assert scored.metadata["tvd_to_gold"] == pytest.approx(0.0)
+
+    no_gold = next(sample for sample in samples if sample.metadata.get("gold_distribution") is None)
+    no_gold_score = _score_decision(
+        raw_probs={label: 1.0 / len(no_gold.metadata["labels"]) for label in no_gold.metadata["labels"]},
+        expected=no_gold.target,
+        labels=no_gold.metadata["labels"],
+        question_type=no_gold.metadata["question_type"],
+        gold_distribution=no_gold.metadata.get("gold_distribution"),
+    )
+    assert "tvd_to_gold" not in no_gold_score.metadata
+
+
 class FakeApi:
     def __init__(self, client):
         self.client = client
@@ -130,14 +184,30 @@ class FakeModel:
         self.api = FakeApi(client)
 
 
-def test_provider_client_decide_uses_sdk_base_auth_and_hooks():
+def test_provider_client_decide_uses_sdk_base_auth_and_hooks(monkeypatch):
     _MODEL_CATALOG_CACHE.clear()
     calls = []
-    decide_hook_calls = []
+    private_model_calls = []
+    provider_hook_paths = []
 
     async def hook(request: httpx.Request) -> None:
-        if request.url.path == "/v1/decide":
-            decide_hook_calls.append(request)
+        provider_hook_paths.append(request.url.path)
+
+    async def models_handler(request: httpx.Request) -> httpx.Response:
+        private_model_calls.append(
+            {
+                "method": request.method,
+                "url": str(request.url),
+                "path": request.url.path,
+                "authorization": request.headers.get("authorization"),
+            }
+        )
+        return httpx.Response(
+            200,
+            json={"data": [{"id": "trustedrouter/trev-1.0", "architecture": {"modality": "text->decision"}}]},
+        )
+
+    _mock_private_catalog(monkeypatch, models_handler)
 
     async def handler(request: httpx.Request) -> httpx.Response:
         calls.append(
@@ -149,11 +219,6 @@ def test_provider_client_decide_uses_sdk_base_auth_and_hooks():
                 "json": json.loads(request.content.decode()) if request.content else None,
             }
         )
-        if request.url.path.endswith("/models"):
-            return httpx.Response(
-                200,
-                json={"data": [{"id": "trustedrouter/trev-1.0", "architecture": {"modality": "text->decision"}}]},
-            )
         return httpx.Response(
             200,
             json={
@@ -193,7 +258,9 @@ def test_provider_client_decide_uses_sdk_base_auth_and_hooks():
     assert decide_calls[0]["url"] == "https://sdk.example/v1/decide"
     assert decide_calls[0]["authorization"] == "Bearer sdk-key"
     assert decide_calls[0]["json"]["model"] == "trustedrouter/trev-1.0"
-    assert len(decide_hook_calls) == 1
+    assert provider_hook_paths == ["/v1/decide"]
+    assert [call["path"] for call in private_model_calls] == ["/v1/models"]
+    assert private_model_calls[0]["authorization"] == "Bearer sdk-key"
     assert _openai_provider_client(FakeModel(provider_client)) is provider_client
     assert result.ok is True
     assert result.probs == {"yes": 0.75, "no": 0.25}
@@ -201,17 +268,20 @@ def test_provider_client_decide_uses_sdk_base_auth_and_hooks():
     assert result.transport == "provider_client"
 
 
-def test_502_no_retry_scores_invalid_on_provider_client():
+def test_502_no_retry_scores_invalid_on_provider_client(monkeypatch):
     _MODEL_CATALOG_CACHE.clear()
     calls = []
 
+    async def models_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"data": [{"id": "trustedrouter/trev-1.0", "architecture": {"modality": "text->decision"}}]},
+        )
+
+    _mock_private_catalog(monkeypatch, models_handler)
+
     async def handler(request: httpx.Request) -> httpx.Response:
         calls.append(request.url.path)
-        if request.url.path.endswith("/models"):
-            return httpx.Response(
-                200,
-                json={"data": [{"id": "trustedrouter/trev-1.0", "architecture": {"modality": "text->decision"}}]},
-            )
         return httpx.Response(
             502,
             headers={"x-should-retry": "false"},
@@ -279,6 +349,29 @@ def test_private_client_fallback_records_transport_and_unknown_source():
     assert result.ok is True
     assert result.probs_source == "unknown"
     assert result.transport == "private_client"
+
+
+def test_model_catalog_is_cached_once_per_base_url():
+    _MODEL_CATALOG_CACHE.clear()
+    calls = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls.append((str(request.url), request.headers.get("authorization")))
+        return httpx.Response(
+            200,
+            json={"data": [{"id": "trustedrouter/trev-1.0", "architecture": {"modality": "text->decision"}}]},
+        )
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            first = await _private_model_modalities(client, "https://cache.example/v1", "key-a")
+            second = await _private_model_modalities(client, "https://cache.example/v1/", "key-b")
+        return first, second
+
+    first, second = asyncio.run(run())
+
+    assert first == second == {"trustedrouter/trev-1.0": "text->decision"}
+    assert calls == [("https://cache.example/v1/models", "Bearer key-a")]
 
 
 def test_model_prefix_stripping():
