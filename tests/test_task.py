@@ -3,15 +3,18 @@ import os
 import asyncio
 
 import httpx
+import openai
 import pytest
 from inspect_ai import eval
 
 from jevbench.task import (
     INVALID_REASONS,
+    _MODEL_CATALOG_CACHE,
     _gateway_decide,
     _load_records,
     _load_samples,
     _model_id_for_gateway,
+    _openai_provider_client,
     _score_decision,
     _translate_question,
     jevbench,
@@ -117,7 +120,89 @@ def test_scorer_distribution_metrics():
     assert score.metadata["ordinal_mae"] == pytest.approx(0.3)
 
 
-def test_502_no_retry_scores_invalid():
+class FakeApi:
+    def __init__(self, client):
+        self.client = client
+
+
+class FakeModel:
+    def __init__(self, client):
+        self.api = FakeApi(client)
+
+
+def test_provider_client_decide_uses_sdk_base_auth_and_hooks():
+    _MODEL_CATALOG_CACHE.clear()
+    calls = []
+    decide_hook_calls = []
+
+    async def hook(request: httpx.Request) -> None:
+        if request.url.path == "/v1/decide":
+            decide_hook_calls.append(request)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(
+            {
+                "method": request.method,
+                "url": str(request.url),
+                "path": request.url.path,
+                "authorization": request.headers.get("authorization"),
+                "json": json.loads(request.content.decode()) if request.content else None,
+            }
+        )
+        if request.url.path.endswith("/models"):
+            return httpx.Response(
+                200,
+                json={"data": [{"id": "trustedrouter/trev-1.0", "architecture": {"modality": "text->decision"}}]},
+            )
+        return httpx.Response(
+            200,
+            json={
+                "model": "trustedrouter/trev-1.0",
+                "answers": {"decision": {"probability": 0.75}},
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            },
+        )
+
+    http_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        event_hooks={"request": [hook]},
+    )
+    provider_client = openai.AsyncOpenAI(
+        api_key="sdk-key",
+        base_url="https://sdk.example/v1",
+        http_client=http_client,
+    )
+
+    try:
+        result = asyncio.run(
+            _gateway_decide(
+                state_value="state",
+                question={"type": "noul", "instructions": "Allowed?", "criteria": {"true": "yes", "false": "no"}},
+                labels=["no", "yes"],
+                model_id="trustedrouter/trev-1.0",
+                timeout_s=5,
+                provider_client=provider_client,
+            )
+        )
+    finally:
+        asyncio.run(provider_client.close())
+
+    decide_calls = [call for call in calls if call["path"] == "/v1/decide"]
+    assert len(decide_calls) == 1
+    assert decide_calls[0]["method"] == "POST"
+    assert decide_calls[0]["url"] == "https://sdk.example/v1/decide"
+    assert decide_calls[0]["authorization"] == "Bearer sdk-key"
+    assert decide_calls[0]["json"]["model"] == "trustedrouter/trev-1.0"
+    assert len(decide_hook_calls) == 1
+    assert _openai_provider_client(FakeModel(provider_client)) is provider_client
+    assert result.ok is True
+    assert result.probs == {"yes": 0.75, "no": 0.25}
+    assert result.probs_source == "native"
+    assert result.transport == "provider_client"
+
+
+def test_502_no_retry_scores_invalid_on_provider_client():
+    _MODEL_CATALOG_CACHE.clear()
     calls = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -133,23 +218,67 @@ def test_502_no_retry_scores_invalid():
             json={"model": "trustedrouter/trev-1.0"},
         )
 
+    provider_client = openai.AsyncOpenAI(
+        api_key="sdk-key",
+        base_url="https://api.trustedrouter.com/v1",
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+
+    try:
+        result = asyncio.run(
+            _gateway_decide(
+                state_value="state",
+                question={"type": "noul", "instructions": "Allowed?", "criteria": {"true": "yes", "false": "no"}},
+                labels=["no", "yes"],
+                model_id="trustedrouter/trev-1.0",
+                timeout_s=5,
+                provider_client=provider_client,
+            )
+        )
+    finally:
+        asyncio.run(provider_client.close())
+
+    assert calls.count("/v1/decide") == 1
+    assert result.ok is False
+    assert result.invalid_reason == "http_502_no_retry"
+    assert result.probs_source == "native"
+    assert result.transport == "provider_client"
+
+
+def test_private_client_fallback_records_transport_and_unknown_source():
+    _MODEL_CATALOG_CACHE.clear()
+    calls = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls.append((request.url.path, request.headers.get("authorization")))
+        if request.url.path.endswith("/models"):
+            return httpx.Response(500, json={"error": "catalog unavailable"})
+        return httpx.Response(
+            200,
+            json={
+                "model": "trustedrouter/trev-1.0",
+                "answers": {"decision": {"probability": 0.6}},
+            },
+        )
+
     result = asyncio.run(
         _gateway_decide(
             state_value="state",
             question={"type": "noul", "instructions": "Allowed?", "criteria": {"true": "yes", "false": "no"}},
             labels=["no", "yes"],
             model_id="trustedrouter/trev-1.0",
-            base_url="https://api.trustedrouter.com/v1",
-            api_key="test",
+            base_url="https://fallback.example/v1",
+            api_key="fallback-key",
             timeout_s=5,
             transport=httpx.MockTransport(handler),
         )
     )
 
-    assert calls.count("/v1/decide") == 1
-    assert result.ok is False
-    assert result.invalid_reason == "http_502_no_retry"
-    assert result.probs_source == "native"
+    assert ("/v1/decide", "Bearer fallback-key") in calls
+    assert _openai_provider_client(FakeModel(object())) is None
+    assert result.ok is True
+    assert result.probs_source == "unknown"
+    assert result.transport == "private_client"
 
 
 def test_model_prefix_stripping():
@@ -174,3 +303,32 @@ def test_live_smoke_three_question_types():
     )
     assert logs
     assert logs[0].status == "success"
+
+
+def test_non_finite_probabilities_are_invalid_never_correct():
+    import math
+    from jevbench.task import _validate_distribution, _score_decision
+    assert _validate_distribution({"no": math.nan, "yes": 1.0}, ["no", "yes"]) == (None, "out_of_range")
+    assert _validate_distribution({"no": math.inf, "yes": 0.0}, ["no", "yes"]) == (None, "out_of_range")
+    score = _score_decision(raw_probs={"no": math.nan, "yes": 1.0}, expected="no", labels=["no", "yes"],
+                            question_type="noul", gold_distribution=None, result_metadata={}, preset_invalid_reason=None)
+    assert score.value != "C" and score.metadata["invalid_reason"] == "out_of_range"
+
+
+def test_gold_rationales_never_reach_sample_metadata():
+    from jevbench.task import _load_samples
+    for sample in _load_samples():
+        prov = sample.metadata.get("provenance") or {}
+        assert set(prov) <= {"source", "license", "label_basis", "exclude_reason"}, sample.id
+    # The actual gold text of every hard record must be absent, not just the key.
+    from jevbench.task import _load_records
+    samples = {s.id: s for s in _load_samples()}
+    for record in _load_records("hard"):
+        prov = record.get("provenance") or {}
+        blob = str(samples[record["id"]].metadata) + str(samples[record["id"]].input)
+        # surface_answer is one of the task's own labels (the tempting wrong one), so
+        # its text legitimately appears in the label list; only the prose is checked.
+        for key in ("rationale", "why_hard"):
+            text = prov.get(key)
+            if isinstance(text, str) and len(text) > 20:
+                assert text not in blob, (record["id"], key)

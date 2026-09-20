@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import time
 from dataclasses import dataclass
@@ -43,6 +44,7 @@ class DecisionResult:
     usage: dict[str, Any]
     latency_s: float
     served_model: str
+    transport: str
     invalid_reason: str | None = None
 
 
@@ -85,6 +87,15 @@ def _load_records(tier: str | None = None) -> list[dict[str, Any]]:
     return records
 
 
+_PUBLIC_PROVENANCE_KEYS = ("source", "license", "label_basis", "exclude_reason")
+
+
+def _public_provenance(provenance: Any) -> dict[str, Any] | None:
+    if not isinstance(provenance, dict):
+        return None
+    return {k: provenance[k] for k in _PUBLIC_PROVENANCE_KEYS if k in provenance}
+
+
 def _sample_from_record(record: dict[str, Any]) -> Sample:
     labels = [str(label) for label in record["labels"]]
     metadata: dict[str, Any] = {
@@ -94,7 +105,10 @@ def _sample_from_record(record: dict[str, Any]) -> Sample:
         "split": record.get("split"),
         "question_type": record["question"]["type"],
         "labels": labels,
-        "provenance": record.get("provenance"),
+        # Only the provenance fields that describe WHERE a task came from. The hard
+        # tier's provenance also carries the authors' gold rationale and a surface
+        # answer, and Inspect logs retain sample metadata, so those would publish.
+        "provenance": _public_provenance(record.get("provenance")),
         "state": record["state"],
         "question": record["question"],
     }
@@ -168,10 +182,52 @@ def _decide_url(base_url: str) -> str:
     return f"{base_url.rstrip('/')}/decide"
 
 
-async def _model_modalities(
+def _openai_provider_client(model: Any) -> Any | None:
+    try:
+        import openai
+    except ImportError:
+        return None
+
+    client = getattr(getattr(model, "api", None), "client", None)
+    return client if isinstance(client, openai.AsyncOpenAI) else None
+
+
+def _sdk_status_response(exc: BaseException) -> httpx.Response | None:
+    response = getattr(exc, "response", None)
+    return response if isinstance(response, httpx.Response) else None
+
+
+def _is_sdk_transport_error(exc: BaseException) -> bool:
+    try:
+        import openai
+    except ImportError:
+        return False
+
+    return isinstance(exc, (openai.APIConnectionError, openai.APITimeoutError))
+
+
+def _modalities_from_payload(payload: Any) -> dict[str, str]:
+    if isinstance(payload, dict):
+        data = payload.get("data", [])
+    elif isinstance(payload, list):
+        data = payload
+    else:
+        data = []
+    modalities: dict[str, str] = {}
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        model_id = item.get("id") or item.get("name")
+        modality = (item.get("architecture") or {}).get("modality")
+        if isinstance(model_id, str) and isinstance(modality, str):
+            modalities[model_id] = modality
+    return modalities
+
+
+async def _private_model_modalities(
     client: httpx.AsyncClient, base_url: str, api_key: str
 ) -> dict[str, str]:
-    cache_key = (base_url.rstrip("/"), api_key)
+    cache_key = (base_url.rstrip("/"), f"private:{api_key}")
     if cache_key in _MODEL_CATALOG_CACHE:
         return _MODEL_CATALOG_CACHE[cache_key]
 
@@ -194,19 +250,40 @@ async def _model_modalities(
                 return {}
             response.raise_for_status()
             payload = response.json()
-        except (httpx.RequestError, ValueError):
+        except (httpx.HTTPError, ValueError):
             _MODEL_CATALOG_CACHE[cache_key] = {}
             return {}
 
-        data = payload.get("data", payload if isinstance(payload, list) else [])
-        modalities: dict[str, str] = {}
-        for item in data:
-            if not isinstance(item, dict):
-                continue
-            model_id = item.get("id") or item.get("name")
-            modality = (item.get("architecture") or {}).get("modality")
-            if isinstance(model_id, str) and isinstance(modality, str):
-                modalities[model_id] = modality
+        modalities = _modalities_from_payload(payload)
+        _MODEL_CATALOG_CACHE[cache_key] = modalities
+        return modalities
+
+
+async def _provider_model_modalities(provider_client: Any, timeout_s: float) -> dict[str, str]:
+    cache_key = (str(provider_client.base_url).rstrip("/"), f"provider:{id(provider_client)}")
+    if cache_key in _MODEL_CATALOG_CACHE:
+        return _MODEL_CATALOG_CACHE[cache_key]
+
+    global _MODEL_CATALOG_LOCK
+    if _MODEL_CATALOG_LOCK is None:
+        _MODEL_CATALOG_LOCK = asyncio.Lock()
+
+    async with _MODEL_CATALOG_LOCK:
+        if cache_key in _MODEL_CATALOG_CACHE:
+            return _MODEL_CATALOG_CACHE[cache_key]
+        try:
+            response = await provider_client.get(
+                "/models",
+                cast_to=httpx.Response,
+                options={"max_retries": 0, "timeout": timeout_s},
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except Exception:
+            _MODEL_CATALOG_CACHE[cache_key] = {}
+            return {}
+
+        modalities = _modalities_from_payload(payload)
         _MODEL_CATALOG_CACHE[cache_key] = modalities
         return modalities
 
@@ -229,43 +306,72 @@ async def _gateway_decide(
     question: dict[str, Any],
     labels: list[str],
     model_id: str,
-    base_url: str,
-    api_key: str,
+    base_url: str | None = None,
+    api_key: str | None = None,
     timeout_s: float,
     transport: httpx.AsyncBaseTransport | None = None,
+    provider_client: Any | None = None,
 ) -> DecisionResult:
-    timeout = httpx.Timeout(timeout_s)
-    async with httpx.AsyncClient(timeout=timeout, transport=transport) as client:
-        modalities = await _model_modalities(client, base_url, api_key)
+    async def decide_with_client(client: httpx.AsyncClient | None) -> DecisionResult:
+        if provider_client is not None:
+            modalities = await _provider_model_modalities(provider_client, timeout_s)
+            transport_name = "provider_client"
+        else:
+            if client is None or base_url is None or api_key is None:
+                raise RuntimeError("OPENAI_BASE_URL and OPENAI_API_KEY are required without an Inspect provider client")
+            modalities = await _private_model_modalities(client, base_url, api_key)
+            transport_name = "private_client"
+
         body = {
             "state": state_value,
             "model": model_id,
             "questions": {"decision": _translate_question(question, labels)},
         }
-        headers = {"Authorization": f"Bearer {api_key}"}
         last_status = 0
         t0 = time.perf_counter()
         for attempt in range(3):
             try:
-                response = await client.post(_decide_url(base_url), headers=headers, json=body)
-            except (httpx.TimeoutException, httpx.TransportError):
-                if attempt < 2:
-                    await asyncio.sleep(0.25 * (2**attempt))
-                    continue
-                return DecisionResult(False, None, "unknown", {}, time.perf_counter() - t0, model_id, "timeout")
+                if provider_client is not None:
+                    response = await provider_client.post(
+                        "/decide",
+                        body=body,
+                        cast_to=httpx.Response,
+                        options={"max_retries": 0, "timeout": timeout_s},
+                    )
+                else:
+                    assert client is not None and base_url is not None and api_key is not None
+                    response = await client.post(
+                        _decide_url(base_url),
+                        headers={"Authorization": f"Bearer {api_key}"},
+                        json=body,
+                    )
+            except Exception as exc:
+                response = _sdk_status_response(exc) if provider_client is not None else None
+                if response is None and not (
+                    isinstance(exc, (httpx.TimeoutException, httpx.TransportError))
+                    or (provider_client is not None and _is_sdk_transport_error(exc))
+                ):
+                    raise
+                if response is not None:
+                    last_status = response.status_code
+                else:
+                    if attempt < 2:
+                        await asyncio.sleep(0.25 * (2**attempt))
+                        continue
+                    return DecisionResult(False, None, "unknown", {}, time.perf_counter() - t0, model_id, transport_name, "timeout")
 
             last_status = response.status_code
             if last_status in {400, 401, 402, 403}:
                 response.raise_for_status()
             if last_status == 502 and response.headers.get("x-should-retry", "").lower() == "false":
                 served_model = _served_model(response, model_id)
-                return DecisionResult(False, None, _probs_source(modalities, served_model), {}, time.perf_counter() - t0, served_model, "http_502_no_retry")
+                return DecisionResult(False, None, _probs_source(modalities, served_model), {}, time.perf_counter() - t0, served_model, transport_name, "http_502_no_retry")
             if 500 <= last_status <= 599:
                 if attempt < 2:
                     await asyncio.sleep(0.25 * (2**attempt))
                     continue
                 served_model = _served_model(response, model_id)
-                return DecisionResult(False, None, _probs_source(modalities, served_model), {}, time.perf_counter() - t0, served_model, "http_5xx")
+                return DecisionResult(False, None, _probs_source(modalities, served_model), {}, time.perf_counter() - t0, served_model, transport_name, "http_5xx")
 
             response.raise_for_status()
             payload = response.json()
@@ -279,10 +385,18 @@ async def _gateway_decide(
                 usage=payload.get("usage") or {},
                 latency_s=time.perf_counter() - t0,
                 served_model=served_model,
+                transport=transport_name,
                 invalid_reason=None if probs is not None else "missing_answer",
             )
 
-        return DecisionResult(False, None, "unknown", {}, time.perf_counter() - t0, model_id, "http_5xx" if last_status else "timeout")
+        return DecisionResult(False, None, "unknown", {}, time.perf_counter() - t0, model_id, transport_name, "http_5xx" if last_status else "timeout")
+
+    if provider_client is not None:
+        return await decide_with_client(None)
+
+    timeout = httpx.Timeout(timeout_s)
+    async with httpx.AsyncClient(timeout=timeout, transport=transport) as client:
+        return await decide_with_client(client)
 
 
 def _served_model(response: httpx.Response, fallback: str) -> str:
@@ -294,7 +408,10 @@ def _served_model(response: httpx.Response, fallback: str) -> str:
 
 
 def _probs_source(modalities: dict[str, str], served_model: str) -> str:
-    return "native" if modalities.get(served_model) == "text->decision" else "verbalized"
+    modality = modalities.get(served_model)
+    if modality is None:
+        return "unknown"
+    return "native" if modality == "text->decision" else "verbalized"
 
 
 def _validate_distribution(raw: Any, labels: list[str]) -> tuple[dict[str, float] | None, str | None]:
@@ -311,6 +428,10 @@ def _validate_distribution(raw: Any, labels: list[str]) -> tuple[dict[str, float
         if not isinstance(value, int | float) or isinstance(value, bool):
             return None, "wrong_type"
         value = float(value)
+        # NaN passes every comparison below, renormalises to NaN and then wins an
+        # argmax; a non-finite probability is not a forecast (review finding).
+        if not math.isfinite(value):
+            return None, "out_of_range"
         if value < 0.0 or value > 1.0:
             return None, "out_of_range"
         probs[label] = value
@@ -399,13 +520,19 @@ def mean_brier():
 def trustedrouter_decision_solver(timeout_s: float = 120.0):
     async def solve(state: TaskState, generate: Generate) -> TaskState:
         del generate
-        base_url = os.environ.get("OPENAI_BASE_URL", "https://api.trustedrouter.com/v1")
-        api_key = os.environ.get("OPENAI_API_KEY", "")
-        if not api_key:
-            raise RuntimeError("OPENAI_API_KEY is required for JevBench gateway calls")
-
         labels = [str(label) for label in state.metadata["labels"]]
-        model_id = _model_id_for_gateway(str(get_model().name))
+        model = get_model()
+        model_id = _model_id_for_gateway(str(model.name))
+        provider_client = _openai_provider_client(model)
+        base_url = None
+        api_key = None
+        if provider_client is None:
+            # Only providers without Inspect's OpenAI SDK client need env auth;
+            # AnyEval accounting is attached to the provider client when present.
+            base_url = os.environ.get("OPENAI_BASE_URL", "https://api.trustedrouter.com/v1")
+            api_key = os.environ.get("OPENAI_API_KEY", "")
+            if not api_key:
+                raise RuntimeError("OPENAI_API_KEY is required for JevBench gateway calls without an Inspect provider client")
         result = await _gateway_decide(
             state_value=state.metadata["state"],
             question=state.metadata["question"],
@@ -414,6 +541,7 @@ def trustedrouter_decision_solver(timeout_s: float = 120.0):
             base_url=base_url,
             api_key=api_key,
             timeout_s=timeout_s,
+            provider_client=provider_client,
         )
         state.metadata["jevbench_result"] = {
             "probs": result.probs,
@@ -421,6 +549,7 @@ def trustedrouter_decision_solver(timeout_s: float = 120.0):
             "usage": result.usage,
             "latency_s": result.latency_s,
             "served_model": result.served_model,
+            "transport": result.transport,
             "invalid_reason": result.invalid_reason,
         }
         state.completed = True
@@ -435,7 +564,7 @@ def jevbench_scorer():
         result = state.metadata.get("jevbench_result") or {}
         result_metadata = {
             key: result.get(key)
-            for key in ("probs_source", "usage", "latency_s", "served_model")
+            for key in ("probs_source", "usage", "latency_s", "served_model", "transport")
             if key in result
         }
         return _score_decision(
