@@ -48,6 +48,23 @@ class DecisionResult:
     invalid_reason: str | None = None
 
 
+@dataclass(frozen=True)
+class _SDKStatusResponse:
+    status_code: int
+    headers: Any
+    response: Any
+    exc: BaseException
+
+    def json(self) -> Any:
+        json_fn = getattr(self.response, "json", None)
+        if not callable(json_fn):
+            raise ValueError("SDK status response has no JSON body")
+        return json_fn()
+
+    def raise_for_status(self) -> None:
+        raise self.exc
+
+
 def _checked_gold_distribution(
     value: Any, labels: list[str], source: str
 ) -> dict[str, float] | None:
@@ -214,9 +231,46 @@ def _openai_provider_client(model: Any) -> Any | None:
     return client if isinstance(client, openai.AsyncOpenAI) else None
 
 
-def _sdk_status_response(exc: BaseException) -> httpx.Response | None:
+def _status_response(response: Any) -> Any | None:
+    # OpenAI SDK 3.x may vend its own httpx2 response class. Treat SDK
+    # responses structurally so billed provider-client failures are classified.
+    status_code = getattr(response, "status_code", None)
+    headers = getattr(response, "headers", None)
+    return response if isinstance(status_code, int) and callable(getattr(headers, "get", None)) else None
+
+
+def _sdk_status_response(exc: BaseException) -> Any | None:
     response = getattr(exc, "response", None)
-    return response if isinstance(response, httpx.Response) else None
+    if (duck_response := _status_response(response)) is not None:
+        return duck_response
+
+    try:
+        import openai
+    except ImportError:
+        return None
+
+    if isinstance(exc, openai.APIStatusError):
+        # Some SDK status exceptions expose the status separately from the
+        # response object; use both pieces without depending on httpx/httpx2.
+        status_code = getattr(exc, "status_code", None)
+        headers = getattr(getattr(exc, "response", None), "headers", None)
+        if isinstance(status_code, int) and callable(getattr(headers, "get", None)):
+            return _SDKStatusResponse(status_code, headers, exc.response, exc)
+    return None
+
+
+_MISSING = object()
+
+
+def _header_value(headers: Any, name: str, default: str = "") -> str:
+    value = headers.get(name, _MISSING)
+    if value is not _MISSING:
+        return str(value)
+    lower_name = name.lower()
+    for key, item in getattr(headers, "items", lambda: [])():
+        if str(key).lower() == lower_name:
+            return str(item)
+    return default
 
 
 def _is_sdk_transport_error(exc: BaseException) -> bool:
@@ -374,7 +428,7 @@ async def _gateway_decide(
             last_status = response.status_code
             if last_status in {400, 401, 402, 403}:
                 response.raise_for_status()
-            if last_status == 502 and response.headers.get("x-should-retry", "").lower() == "false":
+            if last_status == 502 and _header_value(response.headers, "x-should-retry").lower() == "false":
                 served_model = _served_model(response, model_id)
                 return DecisionResult(False, None, _probs_source(modalities, served_model), {}, time.perf_counter() - t0, served_model, transport_name, "http_502_no_retry")
             if 500 <= last_status <= 599:
@@ -410,7 +464,7 @@ async def _gateway_decide(
         return await decide_with_client(client)
 
 
-def _served_model(response: httpx.Response, fallback: str) -> str:
+def _served_model(response: Any, fallback: str) -> str:
     try:
         payload = response.json()
     except ValueError:

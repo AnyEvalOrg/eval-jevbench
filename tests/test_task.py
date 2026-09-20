@@ -1,6 +1,7 @@
 import json
 import os
 import asyncio
+import importlib
 
 import httpx
 import openai
@@ -184,6 +185,34 @@ class FakeModel:
         self.api = FakeApi(client)
 
 
+def _openai_sdk_httpx_module():
+    probe = openai.AsyncOpenAI(api_key="probe-key", base_url="https://sdk.example/v1")
+    try:
+        probe_client_type = type(probe._client)
+        for cls in probe_client_type.__mro__:
+            if cls.__name__ == "AsyncClient":
+                module = importlib.import_module(cls.__module__.split(".", 1)[0])
+                assert issubclass(probe_client_type, module.AsyncClient)
+                return module
+    finally:
+        asyncio.run(probe.close())
+    raise AssertionError(f"could not find SDK HTTP client base for {probe_client_type!r}")
+
+
+def _sdk_provider_client(sdk_httpx, handler):
+    http_client = sdk_httpx.AsyncClient(transport=sdk_httpx.MockTransport(handler))
+    provider_client = openai.AsyncOpenAI(
+        api_key="sdk-key",
+        base_url="https://api.trustedrouter.com/v1",
+        http_client=http_client,
+    )
+    # The regression must use the OpenAI SDK's own HTTP stack (httpx or httpx2),
+    # because SDK status errors carry that response class through provider calls.
+    assert type(provider_client._client) is type(http_client)
+    assert isinstance(provider_client._client, sdk_httpx.AsyncClient)
+    return provider_client
+
+
 def test_provider_client_decide_uses_sdk_base_auth_and_hooks(monkeypatch):
     _MODEL_CATALOG_CACHE.clear()
     calls = []
@@ -312,6 +341,155 @@ def test_502_no_retry_scores_invalid_on_provider_client(monkeypatch):
     assert result.ok is False
     assert result.invalid_reason == "http_502_no_retry"
     assert result.probs_source == "native"
+    assert result.transport == "provider_client"
+
+
+def test_sdk_httpx2_502_no_retry_scores_invalid_once_on_provider_client(monkeypatch):
+    _MODEL_CATALOG_CACHE.clear()
+    sdk_httpx = _openai_sdk_httpx_module()
+    calls = []
+
+    async def models_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"data": [{"id": "trustedrouter/trev-1.0", "architecture": {"modality": "text->decision"}}]},
+        )
+
+    _mock_private_catalog(monkeypatch, models_handler)
+
+    async def handler(request):
+        calls.append(request.url.path)
+        return sdk_httpx.Response(
+            502,
+            headers={"x-should-retry": "false"},
+            json={"model": "trustedrouter/trev-1.0"},
+        )
+
+    provider_client = _sdk_provider_client(sdk_httpx, handler)
+    try:
+        result = asyncio.run(
+            _gateway_decide(
+                state_value="state",
+                question={"type": "noul", "instructions": "Allowed?", "criteria": {"true": "yes", "false": "no"}},
+                labels=["no", "yes"],
+                model_id="trustedrouter/trev-1.0",
+                timeout_s=5,
+                provider_client=provider_client,
+            )
+        )
+    finally:
+        asyncio.run(provider_client.close())
+
+    assert calls.count("/v1/decide") == 1
+    assert result.ok is False
+    assert result.invalid_reason == "http_502_no_retry"
+    assert result.probs_source == "native"
+    assert result.transport == "provider_client"
+
+
+def test_sdk_httpx2_500_retries_then_scores_http_5xx_on_provider_client(monkeypatch):
+    _MODEL_CATALOG_CACHE.clear()
+    sdk_httpx = _openai_sdk_httpx_module()
+    calls = []
+
+    async def models_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"data": [{"id": "trustedrouter/trev-1.0", "architecture": {"modality": "text->decision"}}]},
+        )
+
+    _mock_private_catalog(monkeypatch, models_handler)
+
+    async def handler(request):
+        calls.append(request.url.path)
+        return sdk_httpx.Response(500, json={"model": "trustedrouter/trev-1.0"})
+
+    provider_client = _sdk_provider_client(sdk_httpx, handler)
+    try:
+        result = asyncio.run(
+            _gateway_decide(
+                state_value="state",
+                question={"type": "noul", "instructions": "Allowed?", "criteria": {"true": "yes", "false": "no"}},
+                labels=["no", "yes"],
+                model_id="trustedrouter/trev-1.0",
+                timeout_s=5,
+                provider_client=provider_client,
+            )
+        )
+    finally:
+        asyncio.run(provider_client.close())
+
+    assert calls.count("/v1/decide") == 3
+    assert result.ok is False
+    assert result.invalid_reason == "http_5xx"
+    assert result.probs_source == "native"
+
+
+def test_sdk_httpx2_400_raises_on_provider_client(monkeypatch):
+    _MODEL_CATALOG_CACHE.clear()
+    sdk_httpx = _openai_sdk_httpx_module()
+    calls = []
+
+    async def models_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": []})
+
+    _mock_private_catalog(monkeypatch, models_handler)
+
+    async def handler(request):
+        calls.append(request.url.path)
+        return sdk_httpx.Response(400, json={"error": {"message": "bad request"}})
+
+    provider_client = _sdk_provider_client(sdk_httpx, handler)
+    try:
+        with pytest.raises(Exception):
+            asyncio.run(
+                _gateway_decide(
+                    state_value="state",
+                    question={"type": "noul", "instructions": "Allowed?", "criteria": {"true": "yes", "false": "no"}},
+                    labels=["no", "yes"],
+                    model_id="trustedrouter/trev-1.0",
+                    timeout_s=5,
+                    provider_client=provider_client,
+                )
+            )
+    finally:
+        asyncio.run(provider_client.close())
+
+    assert calls.count("/v1/decide") == 1
+
+
+def test_sdk_httpx2_timeout_scores_invalid_timeout_on_provider_client(monkeypatch):
+    _MODEL_CATALOG_CACHE.clear()
+    sdk_httpx = _openai_sdk_httpx_module()
+    calls = []
+
+    async def models_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": []})
+
+    _mock_private_catalog(monkeypatch, models_handler)
+
+    async def handler(request):
+        calls.append(request.url.path)
+        raise sdk_httpx.TimeoutException("timed out", request=request)
+
+    provider_client = _sdk_provider_client(sdk_httpx, handler)
+    try:
+        result = asyncio.run(
+            _gateway_decide(
+                state_value="state",
+                question={"type": "noul", "instructions": "Allowed?", "criteria": {"true": "yes", "false": "no"}},
+                labels=["no", "yes"],
+                model_id="trustedrouter/trev-1.0",
+                timeout_s=5,
+                provider_client=provider_client,
+            )
+        )
+    finally:
+        asyncio.run(provider_client.close())
+
+    assert calls.count("/v1/decide") == 3
+    assert result.ok is False
+    assert result.invalid_reason == "timeout"
     assert result.transport == "provider_client"
 
 
