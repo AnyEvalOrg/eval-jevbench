@@ -1,0 +1,476 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import time
+from dataclasses import dataclass
+from importlib import resources
+from typing import Any
+
+import httpx
+from inspect_ai import Task, task
+from inspect_ai.dataset import Sample
+from inspect_ai.model import get_model
+from inspect_ai.scorer import CORRECT, INCORRECT, Score, Target, accuracy, metric, scorer
+from inspect_ai.solver import Generate, TaskState, solver
+
+TIERS = ("original", "easy", "hard")
+DATA_FILES = {
+    "original": "original.jsonl",
+    "easy": "easy.jsonl",
+    "hard": "hard.jsonl",
+}
+INVALID_REASONS = {
+    "missing_answer",
+    "wrong_type",
+    "label_set_mismatch",
+    "out_of_range",
+    "sum_out_of_band",
+    "http_502_no_retry",
+    "http_5xx",
+    "timeout",
+}
+_MODEL_CATALOG_CACHE: dict[tuple[str, str], dict[str, str]] = {}
+_MODEL_CATALOG_LOCK: asyncio.Lock | None = None
+
+
+@dataclass
+class DecisionResult:
+    ok: bool
+    probs: dict[str, Any] | None
+    probs_source: str
+    usage: dict[str, Any]
+    latency_s: float
+    served_model: str
+    invalid_reason: str | None = None
+
+
+def _gold_distribution(record: dict[str, Any]) -> dict[str, float] | None:
+    for key in ("gold_distribution", "expected_distribution", "distribution"):
+        value = record.get(key)
+        if isinstance(value, dict):
+            return {str(k): float(v) for k, v in value.items()}
+    return None
+
+
+def _state_text(state: Any) -> str:
+    if isinstance(state, str):
+        return state
+    return json.dumps(state, ensure_ascii=False, sort_keys=True)
+
+
+def _render_input(record: dict[str, Any]) -> str:
+    labels = [str(label) for label in record["labels"]]
+    return (
+        f"State:\n{_state_text(record['state'])}\n\n"
+        f"Instructions:\n{record['question']['instructions']}\n\n"
+        f"Labels:\n{json.dumps(labels, ensure_ascii=False)}"
+    )
+
+
+def _load_records(tier: str | None = None) -> list[dict[str, Any]]:
+    if tier is not None and tier not in DATA_FILES:
+        raise ValueError(f"tier must be one of {', '.join(TIERS)} or None")
+
+    tiers = [tier] if tier else list(TIERS)
+    records: list[dict[str, Any]] = []
+    data_root = resources.files("jevbench.data")
+    for tier_name in tiers:
+        with (data_root / DATA_FILES[tier_name]).open("r", encoding="utf-8") as f:
+            for line in f:
+                record = json.loads(line)
+                record["_tier"] = tier_name
+                records.append(record)
+    return records
+
+
+def _sample_from_record(record: dict[str, Any]) -> Sample:
+    labels = [str(label) for label in record["labels"]]
+    metadata: dict[str, Any] = {
+        "tier": record["_tier"],
+        "family": record["family"],
+        "group": record.get("group"),
+        "split": record.get("split"),
+        "question_type": record["question"]["type"],
+        "labels": labels,
+        "provenance": record.get("provenance"),
+        "state": record["state"],
+        "question": record["question"],
+    }
+    for key in ("topic",):
+        if key in record:
+            metadata[key] = record[key]
+    gold_distribution = _gold_distribution(record)
+    if gold_distribution is not None:
+        metadata["gold_distribution"] = gold_distribution
+
+    return Sample(
+        id=record["id"],
+        input=_render_input(record),
+        target=str(record["expected"]),
+        metadata=metadata,
+    )
+
+
+def _load_samples(tier: str | None = None) -> list[Sample]:
+    return [_sample_from_record(record) for record in _load_records(tier)]
+
+
+def _translate_question(question: dict[str, Any], labels: list[str]) -> dict[str, Any]:
+    qtype = question["type"]
+    instructions = question["instructions"]
+    criteria = question.get("criteria")
+
+    if qtype == "noul":
+        translated = {"type": "boolean", "instructions": instructions}
+        if isinstance(criteria, dict):
+            tf = {k: criteria[k] for k in ("true", "false") if k in criteria}
+            if tf:
+                translated["criteria"] = tf
+        return translated
+
+    if qtype == "choice":
+        return {
+            "type": "choice",
+            "instructions": instructions,
+            "criteria": {
+                label: criteria.get(label, label) if isinstance(criteria, dict) else label
+                for label in labels
+            },
+        }
+
+    if qtype == "score":
+        if isinstance(criteria, dict):
+            levels = [criteria[str(i)] for i in range(len(labels))]
+        else:
+            levels = list(criteria or [])
+        return {"type": "score", "instructions": instructions, "criteria": levels}
+
+    raise ValueError(f"unknown question type: {qtype}")
+
+
+def _model_id_for_gateway(model_name: str) -> str:
+    if model_name.startswith("openai/"):
+        model_name = model_name[len("openai/") :]
+    # Treat trustedrouter/ as an Inspect provider prefix only when another
+    # provider id remains; trustedrouter/trev-1.0 is itself a gateway model id.
+    if model_name.startswith("trustedrouter/") and "/" in model_name[len("trustedrouter/") :]:
+        model_name = model_name[len("trustedrouter/") :]
+    return model_name
+
+
+def _models_url(base_url: str) -> str:
+    return f"{base_url.rstrip('/')}/models"
+
+
+def _decide_url(base_url: str) -> str:
+    return f"{base_url.rstrip('/')}/decide"
+
+
+async def _model_modalities(
+    client: httpx.AsyncClient, base_url: str, api_key: str
+) -> dict[str, str]:
+    cache_key = (base_url.rstrip("/"), api_key)
+    if cache_key in _MODEL_CATALOG_CACHE:
+        return _MODEL_CATALOG_CACHE[cache_key]
+
+    global _MODEL_CATALOG_LOCK
+    if _MODEL_CATALOG_LOCK is None:
+        _MODEL_CATALOG_LOCK = asyncio.Lock()
+
+    async with _MODEL_CATALOG_LOCK:
+        if cache_key in _MODEL_CATALOG_CACHE:
+            return _MODEL_CATALOG_CACHE[cache_key]
+        try:
+            response = await client.get(
+                _models_url(base_url),
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+            if response.status_code in {401, 402, 403}:
+                response.raise_for_status()
+            if response.status_code >= 500:
+                _MODEL_CATALOG_CACHE[cache_key] = {}
+                return {}
+            response.raise_for_status()
+            payload = response.json()
+        except (httpx.RequestError, ValueError):
+            _MODEL_CATALOG_CACHE[cache_key] = {}
+            return {}
+
+        data = payload.get("data", payload if isinstance(payload, list) else [])
+        modalities: dict[str, str] = {}
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            model_id = item.get("id") or item.get("name")
+            modality = (item.get("architecture") or {}).get("modality")
+            if isinstance(model_id, str) and isinstance(modality, str):
+                modalities[model_id] = modality
+        _MODEL_CATALOG_CACHE[cache_key] = modalities
+        return modalities
+
+
+def _extract_probs(answer: dict[str, Any], qtype: str) -> dict[str, Any] | None:
+    if qtype == "noul":
+        if "probability" not in answer:
+            return None
+        p = answer["probability"]
+        return {"yes": p, "no": 1 - p} if isinstance(p, int | float) and not isinstance(p, bool) else {"yes": p, "no": None}
+    if qtype in {"choice", "score"}:
+        probs = answer.get("probabilities")
+        return dict(probs) if isinstance(probs, dict) else None
+    raise ValueError(f"unknown question type: {qtype}")
+
+
+async def _gateway_decide(
+    *,
+    state_value: Any,
+    question: dict[str, Any],
+    labels: list[str],
+    model_id: str,
+    base_url: str,
+    api_key: str,
+    timeout_s: float,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> DecisionResult:
+    timeout = httpx.Timeout(timeout_s)
+    async with httpx.AsyncClient(timeout=timeout, transport=transport) as client:
+        modalities = await _model_modalities(client, base_url, api_key)
+        body = {
+            "state": state_value,
+            "model": model_id,
+            "questions": {"decision": _translate_question(question, labels)},
+        }
+        headers = {"Authorization": f"Bearer {api_key}"}
+        last_status = 0
+        t0 = time.perf_counter()
+        for attempt in range(3):
+            try:
+                response = await client.post(_decide_url(base_url), headers=headers, json=body)
+            except (httpx.TimeoutException, httpx.TransportError):
+                if attempt < 2:
+                    await asyncio.sleep(0.25 * (2**attempt))
+                    continue
+                return DecisionResult(False, None, "unknown", {}, time.perf_counter() - t0, model_id, "timeout")
+
+            last_status = response.status_code
+            if last_status in {400, 401, 402, 403}:
+                response.raise_for_status()
+            if last_status == 502 and response.headers.get("x-should-retry", "").lower() == "false":
+                served_model = _served_model(response, model_id)
+                return DecisionResult(False, None, _probs_source(modalities, served_model), {}, time.perf_counter() - t0, served_model, "http_502_no_retry")
+            if 500 <= last_status <= 599:
+                if attempt < 2:
+                    await asyncio.sleep(0.25 * (2**attempt))
+                    continue
+                served_model = _served_model(response, model_id)
+                return DecisionResult(False, None, _probs_source(modalities, served_model), {}, time.perf_counter() - t0, served_model, "http_5xx")
+
+            response.raise_for_status()
+            payload = response.json()
+            served_model = str(payload.get("model") or model_id)
+            answer = ((payload.get("answers") or {}).get("decision") or {})
+            probs = _extract_probs(answer, question["type"]) if isinstance(answer, dict) else None
+            return DecisionResult(
+                ok=probs is not None,
+                probs=probs,
+                probs_source=_probs_source(modalities, served_model),
+                usage=payload.get("usage") or {},
+                latency_s=time.perf_counter() - t0,
+                served_model=served_model,
+                invalid_reason=None if probs is not None else "missing_answer",
+            )
+
+        return DecisionResult(False, None, "unknown", {}, time.perf_counter() - t0, model_id, "http_5xx" if last_status else "timeout")
+
+
+def _served_model(response: httpx.Response, fallback: str) -> str:
+    try:
+        payload = response.json()
+    except ValueError:
+        return fallback
+    return str(payload.get("model") or fallback) if isinstance(payload, dict) else fallback
+
+
+def _probs_source(modalities: dict[str, str], served_model: str) -> str:
+    return "native" if modalities.get(served_model) == "text->decision" else "verbalized"
+
+
+def _validate_distribution(raw: Any, labels: list[str]) -> tuple[dict[str, float] | None, str | None]:
+    if raw is None:
+        return None, "missing_answer"
+    if not isinstance(raw, dict):
+        return None, "wrong_type"
+    if set(raw) != set(labels):
+        return None, "label_set_mismatch"
+
+    probs: dict[str, float] = {}
+    for label in labels:
+        value = raw[label]
+        if not isinstance(value, int | float) or isinstance(value, bool):
+            return None, "wrong_type"
+        value = float(value)
+        if value < 0.0 or value > 1.0:
+            return None, "out_of_range"
+        probs[label] = value
+
+    total = sum(probs.values())
+    if abs(total - 1.0) > 0.02 or total <= 0.0:
+        return None, "sum_out_of_band"
+    if total != 1.0:
+        probs = {label: value / total for label, value in probs.items()}
+    return probs, None
+
+
+def _brier(probs: dict[str, float], expected: str, labels: list[str]) -> float:
+    return sum((probs[label] - (1.0 if label == expected else 0.0)) ** 2 for label in labels)
+
+
+def _tvd(probs: dict[str, float], gold: dict[str, float], labels: list[str]) -> float:
+    return 0.5 * sum(abs(probs.get(label, 0.0) - gold.get(label, 0.0)) for label in labels)
+
+
+def _ordinal_mae(probs: dict[str, float], expected: str) -> float | None:
+    try:
+        expected_i = int(expected)
+        return sum(prob * abs(int(label) - expected_i) for label, prob in probs.items())
+    except ValueError:
+        return None
+
+
+def _score_decision(
+    *,
+    raw_probs: Any,
+    expected: str,
+    labels: list[str],
+    question_type: str,
+    gold_distribution: dict[str, float] | None = None,
+    result_metadata: dict[str, Any] | None = None,
+    preset_invalid_reason: str | None = None,
+) -> Score:
+    result_metadata = result_metadata or {}
+    metadata = dict(result_metadata)
+    if preset_invalid_reason is not None:
+        metadata["invalid_reason"] = preset_invalid_reason
+        metadata["correct"] = False
+        return Score(value=INCORRECT, answer=None, metadata=metadata)
+
+    probs, invalid_reason = _validate_distribution(raw_probs, labels)
+    if invalid_reason is not None:
+        metadata["invalid_reason"] = invalid_reason
+        metadata["correct"] = False
+        return Score(value=INCORRECT, answer=None, metadata=metadata)
+
+    assert probs is not None
+    answer = max(labels, key=lambda label: probs[label])
+    correct = answer == expected
+    metadata.update(
+        {
+            "probs": probs,
+            "brier": _brier(probs, expected, labels),
+            "top_confidence": probs[answer],
+            "correct": correct,
+        }
+    )
+    if gold_distribution is not None:
+        metadata["tvd_to_gold"] = _tvd(probs, gold_distribution, labels)
+    if question_type == "score":
+        ordinal_mae = _ordinal_mae(probs, expected)
+        if ordinal_mae is not None:
+            metadata["ordinal_mae"] = ordinal_mae
+    return Score(value=CORRECT if correct else INCORRECT, answer=answer, metadata=metadata)
+
+
+@metric
+def mean_brier():
+    def metric(scores):
+        values = []
+        for item in scores:
+            score = getattr(item, "score", item)
+            if score.metadata and score.metadata.get("brier") is not None:
+                values.append(score.metadata["brier"])
+        return sum(values) / len(values) if values else 0.0
+
+    return metric
+
+
+@solver
+def trustedrouter_decision_solver(timeout_s: float = 120.0):
+    async def solve(state: TaskState, generate: Generate) -> TaskState:
+        del generate
+        base_url = os.environ.get("OPENAI_BASE_URL", "https://api.trustedrouter.com/v1")
+        api_key = os.environ.get("OPENAI_API_KEY", "")
+        if not api_key:
+            raise RuntimeError("OPENAI_API_KEY is required for JevBench gateway calls")
+
+        labels = [str(label) for label in state.metadata["labels"]]
+        model_id = _model_id_for_gateway(str(get_model().name))
+        result = await _gateway_decide(
+            state_value=state.metadata["state"],
+            question=state.metadata["question"],
+            labels=labels,
+            model_id=model_id,
+            base_url=base_url,
+            api_key=api_key,
+            timeout_s=timeout_s,
+        )
+        state.metadata["jevbench_result"] = {
+            "probs": result.probs,
+            "probs_source": result.probs_source,
+            "usage": result.usage,
+            "latency_s": result.latency_s,
+            "served_model": result.served_model,
+            "invalid_reason": result.invalid_reason,
+        }
+        state.completed = True
+        return state
+
+    return solve
+
+
+@scorer(metrics=[accuracy(), mean_brier()])
+def jevbench_scorer():
+    async def score(state: TaskState, target: Target) -> Score:
+        result = state.metadata.get("jevbench_result") or {}
+        result_metadata = {
+            key: result.get(key)
+            for key in ("probs_source", "usage", "latency_s", "served_model")
+            if key in result
+        }
+        return _score_decision(
+            raw_probs=result.get("probs"),
+            expected=target.text,
+            labels=[str(label) for label in state.metadata["labels"]],
+            question_type=state.metadata["question_type"],
+            gold_distribution=state.metadata.get("gold_distribution"),
+            result_metadata=result_metadata,
+            preset_invalid_reason=result.get("invalid_reason"),
+        )
+
+    return score
+
+
+@task
+def jevbench(tier: str | None = None, timeout_s: float = 120) -> Task:
+    return Task(
+        dataset=_load_samples(tier),
+        solver=trustedrouter_decision_solver(timeout_s=timeout_s),
+        scorer=jevbench_scorer(),
+        name="jevbench",
+    )
+
+
+@task
+def jevbench_easy(timeout_s: float = 120) -> Task:
+    return jevbench(tier="easy", timeout_s=timeout_s)
+
+
+@task
+def jevbench_hard(timeout_s: float = 120) -> Task:
+    return jevbench(tier="hard", timeout_s=timeout_s)
+
+
+@task
+def jevbench_original(timeout_s: float = 120) -> Task:
+    return jevbench(tier="original", timeout_s=timeout_s)

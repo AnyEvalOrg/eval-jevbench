@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "eval-jevbench"
+version = "0.1.0"
+description = "AnyEval/Inspect eval package for the public JevBench decision benchmark."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "AnyEvalOrg" }]
+dependencies = ["httpx"]
+
+[project.optional-dependencies]
+inspect = ["inspect_ai==0.3.260"]
+
+[project.entry-points.inspect_ai]
+jevbench = "jevbench.task"
+
+[tool.setuptools.packages.find]
+include = ["jevbench*"]
+
+[tool.setuptools.package-data]
+jevbench = ["data/*.jsonl"]
+
+[tool.pytest.ini_options]
+markers = [
+    "live: calls the TrustedRouter gateway",
+]
