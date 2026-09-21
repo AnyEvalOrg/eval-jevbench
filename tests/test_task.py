@@ -603,3 +603,11 @@ def test_gold_rationales_never_reach_sample_metadata():
             text = prov.get(key)
             if isinstance(text, str) and len(text) > 20:
                 assert text not in blob, (record["id"], key)
+
+
+def test_the_dataset_is_named_for_publication():
+    """AnyEval's publication gate requires reproducibility.dataset.name; an unnamed
+    dataset refused every run on the production worker (2026-09-21)."""
+    from jevbench.task import jevbench, jevbench_hard
+    assert jevbench().dataset.name == "jevbench-public"
+    assert jevbench_hard().dataset.name == "jevbench-public-hard"

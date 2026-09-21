@@ -11,7 +11,7 @@ from typing import Any
 
 import httpx
 from inspect_ai import Task, task
-from inspect_ai.dataset import Sample
+from inspect_ai.dataset import MemoryDataset, Sample
 from inspect_ai.model import get_model
 from inspect_ai.scorer import CORRECT, INCORRECT, Score, Target, accuracy, metric, scorer
 from inspect_ai.solver import Generate, TaskState, solver
@@ -164,6 +164,12 @@ def _sample_from_record(record: dict[str, Any]) -> Sample:
         target=str(record["expected"]),
         metadata=metadata,
     )
+
+
+def _dataset_name(tier: str | None) -> str:
+    """AnyEval refuses to publish a run whose reproducibility record has no dataset
+    name; the public JevBench files are the dataset, named by the tier filter."""
+    return "jevbench-public" if tier is None else f"jevbench-public-{tier}"
 
 
 def _load_samples(tier: str | None = None) -> list[Sample]:
@@ -648,7 +654,7 @@ def jevbench_scorer():
 @task
 def jevbench(tier: str | None = None, timeout_s: float = 120) -> Task:
     return Task(
-        dataset=_load_samples(tier),
+        dataset=MemoryDataset(_load_samples(tier), name=_dataset_name(tier), location="jevbench.data"),
         solver=trustedrouter_decision_solver(timeout_s=timeout_s),
         scorer=jevbench_scorer(),
         name="jevbench",

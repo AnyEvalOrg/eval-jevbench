@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "eval-jevbench"
-version = "0.1.3"
+version = "0.1.4"
 description = "AnyEval/Inspect eval package for the public JevBench decision benchmark."
 readme = "README.md"
 requires-python = ">=3.10"
