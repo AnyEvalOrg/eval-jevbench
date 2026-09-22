@@ -1,5 +1,4 @@
 import json
-import math
 import os
 import asyncio
 import importlib
@@ -13,8 +12,6 @@ from inspect_ai.scorer import Target
 
 import jevbench.task as task_module
 from jevbench.task import (
-    ANSWER_INVALID_REASONS,
-    HARNESS_INVALID_REASONS,
     INVALID_REASONS,
     _MODEL_CATALOG_CACHE,
     _gateway_decide,
@@ -101,7 +98,6 @@ def test_scorer_valid_and_renormalisation_band():
     )
     assert score.metadata["top_confidence"] == pytest.approx(score.metadata["probs"]["yes"])
     assert score.metadata["correct"] is True
-    assert score.metadata["invalid_reason"] is None
 
 
 @pytest.mark.parametrize(
@@ -135,29 +131,10 @@ def test_preset_invalid_reason_score_value_and_metadata(reason):
         question_type="noul",
         preset_invalid_reason=reason,
     )
-    assert ANSWER_INVALID_REASONS.isdisjoint(HARNESS_INVALID_REASONS)
     assert score.metadata["invalid_reason"] == reason
-    # Explicit expectations: changing the production sets must not change the test.
-    if reason == "transport_error":
-        # AnyEval's _from_number classifies NaN as UNSCORED, while "N" is ABSTAINED.
-        assert isinstance(score.value, float) and math.isnan(score.value)
-        assert math.isnan(json.loads(score.model_dump_json())["value"])
-        assert score.metadata["correct"] is None
-    else:
-        assert score.value == "I"
-        assert score.metadata["correct"] is False
-
-
-def _assert_unscored_result(result, reason):
-    score = _score_decision(
-        raw_probs=result.probs,
-        expected="yes",
-        labels=["no", "yes"],
-        question_type="noul",
-        preset_invalid_reason=result.invalid_reason,
-    )
-    assert isinstance(score.value, float) and math.isnan(score.value)
-    assert score.metadata["invalid_reason"] == reason
+    assert score.value == "I"
+    assert score.answer is None
+    assert score.metadata["correct"] is False
 
 
 def _assert_incorrect_result(result, reason):
@@ -723,7 +700,9 @@ def test_model_prefix_stripping(model_name, gateway_id):
     assert _model_id_for_gateway(model_name) == gateway_id
 
 
-@pytest.mark.parametrize("hook_error", [None, "model is not authorized for this trial", "hook bug"])
+@pytest.mark.parametrize("hook_error", [
+    None, "model is not authorized for this trial", "hook bug", "connection failed", "request timed out",
+])
 def test_provider_request_hook_before_wire(monkeypatch, hook_error):
     _MODEL_CATALOG_CACHE.clear()
     sdk_httpx = _openai_sdk_httpx_module()
@@ -849,11 +828,11 @@ def test_response_hook_refusal_text_after_real_wire_call_propagates(monkeypatch,
 @pytest.mark.parametrize("provider", [False, True])
 @pytest.mark.parametrize("failure, reason", [
     ("ConnectError", "transport_error"),
-    ("ConnectTimeout", "transport_error"),
+    ("ConnectTimeout", "timeout"),
     ("ReadTimeout", "timeout"),
     ("PoolTimeout", "timeout"),
-    ("ReadError", "ambiguous_transport_error"),
-    ("WriteError", "ambiguous_transport_error"),
+    ("ReadError", "transport_error"),
+    ("WriteError", "transport_error"),
     ("bug", None),
 ])
 def test_transport_errors_and_unrelated_exceptions(monkeypatch, provider, failure, reason):
@@ -896,96 +875,16 @@ def test_transport_errors_and_unrelated_exceptions(monkeypatch, provider, failur
             assert str(error) == "unexpected bug"
         else:
             result = asyncio.run(call)
-            if failure in {"ConnectError", "ConnectTimeout"}:
-                _assert_unscored_result(result, reason)
-            else:
-                _assert_incorrect_result(result, reason)
+            _assert_incorrect_result(result, reason)
     finally:
         if client is not None:
             asyncio.run(client.close())
     assert len(calls) == (1 if failure == "bug" else 3)
 
 
-@pytest.mark.parametrize("provider", [False, True])
-@pytest.mark.parametrize("first_failure, reason, status", [
-    ("billed_500", "http_5xx", 500),
-    ("502_body_timeout", "timeout", None),
-    ("ReadTimeout", "timeout", None),
-    ("PoolTimeout", "timeout", None),
-    ("ReadError", "ambiguous_transport_error", None),
-])
-def test_response_or_ambiguity_survives_later_connect_errors(
-    monkeypatch, provider, first_failure, reason, status
-):
-    _MODEL_CATALOG_CACHE.clear()
-    http = _openai_sdk_httpx_module() if provider else httpx
-    calls = []
-    body_reads = []
-
-    class TimeoutBody(http.AsyncByteStream):
-        async def __aiter__(self):
-            body_reads.append(502)
-            raise http.ReadTimeout("body timed out after headers")
-            yield b""  # Make this an async generator.
-
-    async def handler(request):
-        if request.url.path.endswith("/models"):
-            return http.Response(200, json={"data": []})
-        calls.append(request)
-        if len(calls) == 1 or first_failure == "502_body_timeout":
-            if first_failure == "billed_500":
-                return http.Response(500, json={
-                    "usage": {"input_tokens": 10, "output_tokens": 20},
-                })
-            if first_failure == "502_body_timeout":
-                return http.Response(502, headers={"x-should-retry": "false"}, stream=TimeoutBody())
-            raise getattr(http, first_failure)("ambiguous failure", request=request)
-        raise http.ConnectError("connect failed", request=request)
-
-    async def catalog(request):
-        return httpx.Response(200, json={"data": []})
-
-    _mock_private_catalog(monkeypatch, catalog)
-    client = _sdk_provider_client(http, handler) if provider else None
-    if not provider:
-        original_client = http.AsyncClient
-        monkeypatch.setattr(task_module.httpx, "AsyncClient", lambda **kwargs: original_client(
-            **{**kwargs, "transport": http.MockTransport(handler)}
-        ))
-    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
-    monkeypatch.setenv("OPENAI_BASE_URL", "https://fallback.example/v1")
-    model = FakeModel(client)
-    model.name = "openai/gpt-5.6-sol"
-    monkeypatch.setattr(task_module, "get_model", lambda: model)
-    state = SimpleNamespace(metadata={
-        "state": "state",
-        "question": {"type": "noul", "instructions": "Allowed?"},
-        "labels": ["no", "yes"],
-        "question_type": "noul",
-    }, completed=False)
-    task = jevbench(timeout_s=5)
-
-    async def run():
-        try:
-            await task.solver(state, None)
-            return await task.scorer[0](state, Target("yes"))
-        finally:
-            if client is not None:
-                await client.close()
-
-    score = asyncio.run(run())
-    assert len(calls) == 3
-    assert body_reads == ([502] * 3 if first_failure == "502_body_timeout" else [])
-    assert score.value == "I"
-    assert score.metadata["correct"] is False
-    assert score.metadata["invalid_reason"] == reason
-    assert score.metadata["status_code"] == status
-    assert state.metadata["jevbench_result"]["status_code"] == status
-
-
 @pytest.mark.parametrize("error_type, reason", [
     (openai.APITimeoutError, "timeout"),
-    (openai.APIConnectionError, "ambiguous_transport_error"),
+    (openai.APIConnectionError, "transport_error"),
 ])
 def test_bare_sdk_connection_errors_are_incorrect(monkeypatch, error_type, reason):
     async def catalog(*args):
