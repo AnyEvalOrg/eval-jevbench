@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import asyncio
 import importlib
@@ -12,6 +13,8 @@ from inspect_ai.scorer import Target
 
 import jevbench.task as task_module
 from jevbench.task import (
+    ANSWER_INVALID_REASONS,
+    HARNESS_INVALID_REASONS,
     INVALID_REASONS,
     _MODEL_CATALOG_CACHE,
     _gateway_decide,
@@ -120,6 +123,39 @@ def test_scorer_invalid_cases(raw_probs, reason):
     assert score.value == "I"
     assert score.metadata["invalid_reason"] == reason
     assert score.metadata["invalid_reason"] in INVALID_REASONS
+
+
+@pytest.mark.parametrize("reason", sorted(INVALID_REASONS))
+def test_preset_invalid_reason_score_value_and_metadata(reason):
+    score = _score_decision(
+        raw_probs=None,
+        expected="yes",
+        labels=["no", "yes"],
+        question_type="noul",
+        preset_invalid_reason=reason,
+    )
+    assert ANSWER_INVALID_REASONS.isdisjoint(HARNESS_INVALID_REASONS)
+    assert score.metadata["invalid_reason"] == reason
+    if reason in HARNESS_INVALID_REASONS:
+        # AnyEval's _from_number classifies NaN as UNSCORED, while "N" is ABSTAINED.
+        assert isinstance(score.value, float) and math.isnan(score.value)
+        assert math.isnan(json.loads(score.model_dump_json())["value"])
+        assert score.metadata["correct"] is None
+    else:
+        assert score.value == "I"
+        assert score.metadata["correct"] is False
+
+
+def _assert_unscored_result(result, reason):
+    score = _score_decision(
+        raw_probs=result.probs,
+        expected="yes",
+        labels=["no", "yes"],
+        question_type="noul",
+        preset_invalid_reason=result.invalid_reason,
+    )
+    assert isinstance(score.value, float) and math.isnan(score.value)
+    assert score.metadata["invalid_reason"] == reason
 
 
 def test_scorer_distribution_metrics():
@@ -436,6 +472,7 @@ def test_502_no_retry_scores_invalid_on_provider_client(monkeypatch):
     assert calls.count("/v1/decide") == 1
     assert result.ok is False
     assert result.invalid_reason == "http_502_no_retry"
+    _assert_unscored_result(result, "http_502_no_retry")
     assert result.probs_source == "native"
     assert result.transport == "provider_client"
 
@@ -479,6 +516,7 @@ def test_sdk_httpx2_502_no_retry_scores_invalid_once_on_provider_client(monkeypa
     assert calls.count("/v1/decide") == 1
     assert result.ok is False
     assert result.invalid_reason == "http_502_no_retry"
+    _assert_unscored_result(result, "http_502_no_retry")
     assert result.probs_source == "native"
     assert result.transport == "provider_client"
 
@@ -518,6 +556,7 @@ def test_sdk_httpx2_500_retries_then_scores_http_5xx_on_provider_client(monkeypa
     assert calls.count("/v1/decide") == 3
     assert result.ok is False
     assert result.invalid_reason == "http_5xx"
+    _assert_unscored_result(result, "http_5xx")
     assert result.probs_source == "native"
 
 
@@ -586,6 +625,7 @@ def test_sdk_httpx2_timeout_scores_invalid_timeout_on_provider_client(monkeypatc
     assert calls.count("/v1/decide") == 3
     assert result.ok is False
     assert result.invalid_reason == "timeout"
+    _assert_unscored_result(result, "timeout")
     assert result.transport == "provider_client"
 
 
@@ -648,10 +688,123 @@ def test_model_catalog_is_cached_once_per_base_url():
     assert calls == [("https://cache.example/v1/models", "Bearer key-a")]
 
 
-def test_model_prefix_stripping():
-    assert _model_id_for_gateway("openai/trustedrouter/trev-1.0") == "trustedrouter/trev-1.0"
-    assert _model_id_for_gateway("trustedrouter/google/gemma-4-31b-it") == "google/gemma-4-31b-it"
-    assert _model_id_for_gateway("google/gemma-4-31b-it") == "google/gemma-4-31b-it"
+@pytest.mark.parametrize(
+    ("model_name", "gateway_id"),
+    [
+        ("openai/gpt-5.6-sol", "openai/gpt-5.6-sol"),
+        ("trustedrouter/trev-1.0", "trustedrouter/trev-1.0"),
+        ("trustedrouter/openai/gpt-5.6-sol", "openai/gpt-5.6-sol"),
+        ("openai/openai/gpt-5.6-sol", "openai/gpt-5.6-sol"),
+        ("openai/trustedrouter/trev-1.0", "trustedrouter/trev-1.0"),
+        ("trustedrouter/google/gemma-4-31b-it", "google/gemma-4-31b-it"),
+        ("google/gemma-4-31b-it", "google/gemma-4-31b-it"),
+        ("deepseek/deepseek-v3", "deepseek/deepseek-v3"),
+    ],
+)
+def test_model_prefix_stripping(model_name, gateway_id):
+    assert _model_id_for_gateway(model_name) == gateway_id
+
+
+@pytest.mark.parametrize("hook_error", [None, "model is not authorized for this trial", "hook bug"])
+def test_provider_request_hook_before_wire(monkeypatch, hook_error):
+    _MODEL_CATALOG_CACHE.clear()
+    sdk_httpx = _openai_sdk_httpx_module()
+    hook_calls = []
+    wire_calls = []
+
+    async def models_handler(request):
+        return httpx.Response(200, json={"data": []})
+
+    _mock_private_catalog(monkeypatch, models_handler)
+
+    async def hook(request):
+        body = json.loads(request.content)
+        hook_calls.append(body)
+        assert body["model"] == "openai/gpt-5.6-sol"
+        if hook_error:
+            raise ValueError(hook_error)
+
+    async def handler(request):
+        wire_calls.append(request)
+        return sdk_httpx.Response(200, json={"answers": {"decision": {"probability": 0.8}}})
+
+    provider_client = openai.AsyncOpenAI(
+        api_key="sdk-key",
+        base_url="https://sdk.example/v1",
+        http_client=sdk_httpx.AsyncClient(
+            transport=sdk_httpx.MockTransport(handler), event_hooks={"request": [hook]}
+        ),
+    )
+    try:
+        call = _gateway_decide(
+            state_value="state",
+            question={"type": "noul", "instructions": "Allowed?", "criteria": {"true": "yes", "false": "no"}},
+            labels=["no", "yes"],
+            model_id=_model_id_for_gateway("openai/gpt-5.6-sol"),
+            timeout_s=5,
+            provider_client=provider_client,
+        )
+        if hook_error == "hook bug":
+            with pytest.raises(openai.APIConnectionError) as caught:
+                asyncio.run(call)
+            assert isinstance(caught.value.__cause__, ValueError)
+            assert str(caught.value.__cause__) == hook_error
+        else:
+            result = asyncio.run(call)
+            if hook_error:
+                _assert_unscored_result(result, "request_refused_locally")
+            else:
+                assert result.ok
+    finally:
+        asyncio.run(provider_client.close())
+
+    assert len(hook_calls) == 1
+    assert len(wire_calls) == (0 if hook_error else 1)
+
+
+@pytest.mark.parametrize("provider", [False, True])
+@pytest.mark.parametrize("failure", ["timeout", "transport_error", "bug"])
+def test_transport_errors_and_unrelated_exceptions(monkeypatch, provider, failure):
+    _MODEL_CATALOG_CACHE.clear()
+    http = _openai_sdk_httpx_module() if provider else httpx
+    calls = []
+
+    async def models_handler(request):
+        return httpx.Response(200, json={"data": []})
+
+    _mock_private_catalog(monkeypatch, models_handler)
+
+    async def handler(request):
+        if request.url.path.endswith("/models"):
+            return http.Response(200, json={"data": []})
+        calls.append(request)
+        if failure == "bug":
+            raise RuntimeError("unexpected bug")
+        error = http.ReadTimeout if failure == "timeout" else http.ConnectError
+        raise error("connection failed", request=request)
+
+    client = _sdk_provider_client(http, handler) if provider else None
+    try:
+        call = _gateway_decide(
+            state_value="state",
+            question={"type": "noul", "instructions": "Allowed?", "criteria": {"true": "yes", "false": "no"}},
+            labels=["no", "yes"],
+            model_id="openai/gpt-5.6-sol",
+            timeout_s=5,
+            base_url="https://fallback.example/v1",
+            api_key="fallback-key",
+            transport=None if provider else http.MockTransport(handler),
+            provider_client=client,
+        )
+        if failure == "bug":
+            with pytest.raises(openai.APIConnectionError if provider else RuntimeError):
+                asyncio.run(call)
+        else:
+            _assert_unscored_result(asyncio.run(call), failure)
+    finally:
+        if client is not None:
+            asyncio.run(client.close())
+    assert len(calls) == (1 if failure == "bug" else 3)
 
 
 @pytest.mark.live

@@ -6,7 +6,7 @@ import math
 import os
 import time
 from dataclasses import dataclass
-from importlib import resources
+from importlib import import_module, resources
 from typing import Any
 
 import httpx
@@ -22,16 +22,21 @@ DATA_FILES = {
     "easy": "easy.jsonl",
     "hard": "hard.jsonl",
 }
-INVALID_REASONS = {
+ANSWER_INVALID_REASONS = {
     "missing_answer",
     "wrong_type",
     "label_set_mismatch",
     "out_of_range",
     "sum_out_of_band",
+}
+HARNESS_INVALID_REASONS = {
     "http_502_no_retry",
     "http_5xx",
     "timeout",
+    "transport_error",
+    "request_refused_locally",
 }
+INVALID_REASONS = ANSWER_INVALID_REASONS | HARNESS_INVALID_REASONS
 _MODEL_CATALOG_CACHE: dict[str, dict[str, str]] = {}
 _MODEL_CATALOG_LOCK: asyncio.Lock | None = None
 
@@ -210,10 +215,10 @@ def _translate_question(question: dict[str, Any], labels: list[str]) -> dict[str
 
 
 def _model_id_for_gateway(model_name: str) -> str:
-    if model_name.startswith("openai/"):
+    # Both names can be Inspect providers OR gateway providers. Strip a prefix
+    # only when another provider segment remains, preserving provider/model ids.
+    if model_name.startswith("openai/") and "/" in model_name[len("openai/") :]:
         model_name = model_name[len("openai/") :]
-    # Treat trustedrouter/ as an Inspect provider prefix only when another
-    # provider id remains; trustedrouter/trev-1.0 is itself a gateway model id.
     if model_name.startswith("trustedrouter/") and "/" in model_name[len("trustedrouter/") :]:
         model_name = model_name[len("trustedrouter/") :]
     return model_name
@@ -286,6 +291,30 @@ def _is_sdk_transport_error(exc: BaseException) -> bool:
         return False
 
     return isinstance(exc, (openai.APIConnectionError, openai.APITimeoutError))
+
+
+def _transport_invalid_reason(exc: BaseException) -> str | None:
+    # The SDK wraps request-hook exceptions as connection errors, even before
+    # the wire. Inspect the cause so local refusals and bugs aren't timeouts.
+    if _is_sdk_transport_error(exc):
+        if exc.__cause__ is not None:
+            return _transport_invalid_reason(exc.__cause__)
+        import openai
+
+        return "timeout" if isinstance(exc, openai.APITimeoutError) else "transport_error"
+    if isinstance(exc, (ValueError, PermissionError, RuntimeError)) and "model is not authorized for this trial" in str(exc):
+        return "request_refused_locally"
+    # SDK 3.x uses httpx2; private requests still use httpx.
+    for package in ("httpx", "httpx2"):
+        try:
+            http = import_module(package)
+        except ImportError:
+            continue
+        if isinstance(exc, http.TimeoutException):
+            return "timeout"
+        if isinstance(exc, http.TransportError):
+            return "transport_error"
+    return None
 
 
 def _modalities_from_payload(payload: Any) -> dict[str, str]:
@@ -421,18 +450,16 @@ async def _gateway_decide(
                     )
             except Exception as exc:
                 response = _sdk_status_response(exc) if provider_client is not None else None
-                if response is None and not (
-                    isinstance(exc, (httpx.TimeoutException, httpx.TransportError))
-                    or (provider_client is not None and _is_sdk_transport_error(exc))
-                ):
-                    raise
                 if response is not None:
                     last_status = response.status_code
                 else:
-                    if attempt < 2:
+                    invalid_reason = _transport_invalid_reason(exc)
+                    if invalid_reason is None:
+                        raise
+                    if invalid_reason != "request_refused_locally" and attempt < 2:
                         await asyncio.sleep(0.25 * (2**attempt))
                         continue
-                    return DecisionResult(False, None, "unknown", {}, time.perf_counter() - t0, model_id, transport_name, "timeout")
+                    return DecisionResult(False, None, "unknown", {}, time.perf_counter() - t0, model_id, transport_name, invalid_reason)
 
             last_status = response.status_code
             if last_status in {400, 401, 402, 403}:
@@ -548,6 +575,10 @@ def _score_decision(
     metadata = dict(result_metadata)
     if preset_invalid_reason is not None:
         metadata["invalid_reason"] = preset_invalid_reason
+        if preset_invalid_reason in HARNESS_INVALID_REASONS:
+            # NOANSWER is a scored abstention in AnyEval; NaN leaves the denominator.
+            metadata["correct"] = None
+            return Score.unscored(metadata=metadata)
         metadata["correct"] = False
         return Score(value=INCORRECT, answer=None, metadata=metadata)
 
