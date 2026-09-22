@@ -58,7 +58,7 @@ The same code path handles native decision models and chat models. The scorer re
 
 ## Scoring
 
-Each task is valid only if the returned distribution covers exactly the label set, has numeric probabilities in `[0, 1]`, and sums to 1 within 2%. Distributions inside the 2% band are renormalized. Invalid answers and recognised HTTP or transport failures are scored incorrect with a fixed `invalid_reason`. Local policy refusals and other unexpected exceptions propagate and fail the run visibly.
+Each task is valid only if the returned distribution covers exactly the label set, has numeric probabilities in `[0, 1]`, and sums to 1 within 2%. Distributions inside the 2% band are renormalized. Invalid or failed calls are scored incorrect with a fixed `invalid_reason`.
 
 Per-task score metadata includes:
 
