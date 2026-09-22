@@ -382,6 +382,7 @@ async def _gateway_decide(
     timeout_s: float,
     transport: httpx.AsyncBaseTransport | None = None,
     provider_client: Any | None = None,
+    reasoning: bool | str | None = None,
 ) -> DecisionResult:
     async def decide_with_client(client: httpx.AsyncClient | None) -> DecisionResult:
         if provider_client is not None:
@@ -398,6 +399,8 @@ async def _gateway_decide(
             "model": model_id,
             "questions": {"decision": _translate_question(question, labels)},
         }
+        if reasoning is not None:
+            body["reasoning"] = True if reasoning is True else {"effort": reasoning}
         last_status = 0
         t0 = time.perf_counter()
         for attempt in range(3):
@@ -588,7 +591,17 @@ def mean_brier():
 
 
 @solver
-def trustedrouter_decision_solver(timeout_s: float = 120.0):
+def trustedrouter_decision_solver(
+    timeout_s: float = 120.0, reasoning: bool | str | None = None
+):
+    # Fail before evaluation so a typo cannot masquerade as a deliberated run.
+    if not (
+        reasoning is None
+        or reasoning is True
+        or (isinstance(reasoning, str) and reasoning in ("low", "medium", "high"))
+    ):
+        raise ValueError('reasoning must be None, True, or one of "low", "medium", "high"')
+
     async def solve(state: TaskState, generate: Generate) -> TaskState:
         del generate
         labels = [str(label) for label in state.metadata["labels"]]
@@ -613,6 +626,7 @@ def trustedrouter_decision_solver(timeout_s: float = 120.0):
             api_key=api_key,
             timeout_s=timeout_s,
             provider_client=provider_client,
+            reasoning=reasoning,
         )
         state.metadata["jevbench_result"] = {
             "probs": result.probs,
@@ -621,6 +635,7 @@ def trustedrouter_decision_solver(timeout_s: float = 120.0):
             "latency_s": result.latency_s,
             "served_model": result.served_model,
             "transport": result.transport,
+            "reasoning": reasoning,
             "invalid_reason": result.invalid_reason,
         }
         state.completed = True
@@ -635,7 +650,7 @@ def jevbench_scorer():
         result = state.metadata.get("jevbench_result") or {}
         result_metadata = {
             key: result.get(key)
-            for key in ("probs_source", "usage", "latency_s", "served_model", "transport")
+            for key in ("probs_source", "usage", "latency_s", "served_model", "transport", "reasoning")
             if key in result
         }
         return _score_decision(
@@ -652,25 +667,27 @@ def jevbench_scorer():
 
 
 @task
-def jevbench(tier: str | None = None, timeout_s: float = 120) -> Task:
+def jevbench(
+    tier: str | None = None, timeout_s: float = 120, reasoning: bool | str | None = None
+) -> Task:
     return Task(
         dataset=MemoryDataset(_load_samples(tier), name=_dataset_name(tier), location="jevbench.data"),
-        solver=trustedrouter_decision_solver(timeout_s=timeout_s),
+        solver=trustedrouter_decision_solver(timeout_s=timeout_s, reasoning=reasoning),
         scorer=jevbench_scorer(),
         name="jevbench",
     )
 
 
 @task
-def jevbench_easy(timeout_s: float = 120) -> Task:
-    return jevbench(tier="easy", timeout_s=timeout_s)
+def jevbench_easy(timeout_s: float = 120, reasoning: bool | str | None = None) -> Task:
+    return jevbench(tier="easy", timeout_s=timeout_s, reasoning=reasoning)
 
 
 @task
-def jevbench_hard(timeout_s: float = 120) -> Task:
-    return jevbench(tier="hard", timeout_s=timeout_s)
+def jevbench_hard(timeout_s: float = 120, reasoning: bool | str | None = None) -> Task:
+    return jevbench(tier="hard", timeout_s=timeout_s, reasoning=reasoning)
 
 
 @task
-def jevbench_original(timeout_s: float = 120) -> Task:
-    return jevbench(tier="original", timeout_s=timeout_s)
+def jevbench_original(timeout_s: float = 120, reasoning: bool | str | None = None) -> Task:
+    return jevbench(tier="original", timeout_s=timeout_s, reasoning=reasoning)

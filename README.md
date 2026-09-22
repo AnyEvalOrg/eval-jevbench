@@ -28,6 +28,12 @@ inspect eval jevbench/jevbench --model openai/trustedrouter/trev-1.0
 
 Convenience tasks are also exported as `jevbench_easy`, `jevbench_hard`, and `jevbench_original`.
 
+All tasks accept `-T reasoning=true`, `-T reasoning=low`, `-T reasoning=medium`,
+or `-T reasoning=high`, or the equivalent `reasoning` value in AnyEval `task_args`. The default
+is `None`, which omits reasoning from the request and preserves existing behavior.
+Other values are rejected at task construction. The [gateway documentation](https://trustedrouter.com/docs/decide)
+specifies `"reasoning": true` or `"reasoning": {"effort": "<level>"}`.
+
 ## Gateway Translation
 
 The solver does not call Inspect `generate()`. It reads the Inspect model name, strips an Inspect provider prefix where needed, and posts one typed decision request to `{OPENAI_BASE_URL}/decide`:
@@ -61,6 +67,7 @@ Per-task score metadata includes:
 - `usage`
 - `latency_s`
 - `served_model`
+- `reasoning`: requested setting (`null`, `true`, `"low"`, `"medium"`, or `"high"`)
 - `brier`
 - `top_confidence`
 - `correct`
