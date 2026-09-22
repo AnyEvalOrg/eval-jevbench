@@ -30,12 +30,13 @@ ANSWER_INVALID_REASONS = {
     "sum_out_of_band",
     "http_502_no_retry",
     "http_5xx",
-}
-# Only failures with no gateway response may leave the denominator. A returned
-# 5xx (even with usage or x-should-retry: false) cannot distinguish infrastructure
-# failure from unusable model output; billing proves neither. Keep it INCORRECT.
-HARNESS_INVALID_REASONS = {
     "timeout",
+    "ambiguous_transport_error",
+}
+# Exclude only what we can prove never reached the model: connect-phase failures
+# on EVERY attempt, with no response/status ever seen. Ambiguity resolves to
+# INCORRECT so a bad model can never hide (including returned/billed 5xx).
+HARNESS_INVALID_REASONS = {
     "transport_error",
 }
 INVALID_REASONS = ANSWER_INVALID_REASONS | HARNESS_INVALID_REASONS
@@ -53,6 +54,7 @@ class DecisionResult:
     served_model: str
     transport: str
     invalid_reason: str | None = None
+    status_code: int | None = None
 
 
 @dataclass(frozen=True)
@@ -306,17 +308,19 @@ def _transport_invalid_reason(exc: BaseException) -> str | None:
             return _transport_invalid_reason(exc.__cause__)
         import openai
 
-        return "timeout" if isinstance(exc, openai.APITimeoutError) else "transport_error"
+        return "timeout" if isinstance(exc, openai.APITimeoutError) else "ambiguous_transport_error"
     # SDK 3.x uses httpx2; private requests still use httpx.
     for package in ("httpx", "httpx2"):
         try:
             http = import_module(package)
         except ImportError:
             continue
+        if isinstance(exc, (http.ConnectError, http.ConnectTimeout)):
+            return "transport_error"
         if isinstance(exc, http.TimeoutException):
             return "timeout"
         if isinstance(exc, http.TransportError):
-            return "transport_error"
+            return "ambiguous_transport_error"
     return None
 
 
@@ -433,7 +437,9 @@ async def _gateway_decide(
         }
         if reasoning is not None:
             body["reasoning"] = True if reasoning is True else {"effort": reasoning}
-        last_status = 0
+        last_status = None
+        no_response_proven = True
+        scored_failure_reason = None
         t0 = time.perf_counter()
         for attempt in range(3):
             try:
@@ -453,17 +459,21 @@ async def _gateway_decide(
                     )
             except Exception as exc:
                 response = _sdk_status_response(exc) if provider_client is not None else None
-                if response is not None:
-                    last_status = response.status_code
-                else:
+                if response is None:
                     invalid_reason = _transport_invalid_reason(exc)
                     if invalid_reason is None:
                         raise
+                    if invalid_reason not in HARNESS_INVALID_REASONS:
+                        no_response_proven = False
+                        scored_failure_reason = scored_failure_reason or invalid_reason
                     if attempt < 2:
                         await asyncio.sleep(0.25 * (2**attempt))
                         continue
-                    return DecisionResult(False, None, "unknown", {}, time.perf_counter() - t0, model_id, transport_name, invalid_reason)
+                    reason = invalid_reason if no_response_proven else scored_failure_reason
+                    return DecisionResult(False, None, "unknown", {}, time.perf_counter() - t0, model_id, transport_name, reason, last_status)
 
+            # Retain delivery evidence across retries, including SDK status errors.
+            no_response_proven = False
             last_status = response.status_code
             if last_status in {400, 401, 402, 403}:
                 response.raise_for_status()
@@ -471,13 +481,14 @@ async def _gateway_decide(
             # x-should-retry: false still makes three attempts. Out of scope here.
             if last_status == 502 and _header_value(response.headers, "x-should-retry").lower() == "false":
                 served_model = _served_model(response, model_id)
-                return DecisionResult(False, None, _probs_source(modalities, served_model), {}, time.perf_counter() - t0, served_model, transport_name, "http_502_no_retry")
+                return DecisionResult(False, None, _probs_source(modalities, served_model), {}, time.perf_counter() - t0, served_model, transport_name, "http_502_no_retry", last_status)
             if 500 <= last_status <= 599:
+                scored_failure_reason = "http_5xx"
                 if attempt < 2:
                     await asyncio.sleep(0.25 * (2**attempt))
                     continue
                 served_model = _served_model(response, model_id)
-                return DecisionResult(False, None, _probs_source(modalities, served_model), {}, time.perf_counter() - t0, served_model, transport_name, "http_5xx")
+                return DecisionResult(False, None, _probs_source(modalities, served_model), {}, time.perf_counter() - t0, served_model, transport_name, "http_5xx", last_status)
 
             response.raise_for_status()
             payload = response.json()
@@ -493,9 +504,10 @@ async def _gateway_decide(
                 served_model=served_model,
                 transport=transport_name,
                 invalid_reason=None if probs is not None else "missing_answer",
+                status_code=last_status,
             )
 
-        return DecisionResult(False, None, "unknown", {}, time.perf_counter() - t0, model_id, transport_name, "http_5xx" if last_status else "timeout")
+        raise AssertionError("decide retries exhausted without a result")
 
     if provider_client is not None:
         return await decide_with_client(None)
@@ -578,8 +590,8 @@ def _score_decision(
 ) -> Score:
     result_metadata = result_metadata or {}
     metadata = dict(result_metadata)
+    metadata["invalid_reason"] = preset_invalid_reason
     if preset_invalid_reason is not None:
-        metadata["invalid_reason"] = preset_invalid_reason
         if preset_invalid_reason in HARNESS_INVALID_REASONS:
             # NOANSWER is a scored abstention in AnyEval; NaN leaves the denominator.
             metadata["correct"] = None
@@ -673,6 +685,7 @@ def trustedrouter_decision_solver(
             "transport": result.transport,
             "reasoning": reasoning,
             "invalid_reason": result.invalid_reason,
+            "status_code": result.status_code,
         }
         state.completed = True
         return state
@@ -686,7 +699,7 @@ def jevbench_scorer():
         result = state.metadata.get("jevbench_result") or {}
         result_metadata = {
             key: result.get(key)
-            for key in ("probs_source", "usage", "latency_s", "served_model", "transport", "reasoning")
+            for key in ("probs_source", "usage", "latency_s", "served_model", "transport", "reasoning", "status_code")
             if key in result
         }
         return _score_decision(

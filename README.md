@@ -58,7 +58,7 @@ The same code path handles native decision models and chat models. The scorer re
 
 ## Scoring
 
-Each task is valid only if the returned distribution covers exactly the label set, has numeric probabilities in `[0, 1]`, and sums to 1 within 2%. Distributions inside the 2% band are renormalized. Missing or invalid answers and HTTP server errors are scored incorrect: a returned 5xx cannot distinguish infrastructure failure from unusable model output. Timeouts and transport errors without a gateway response are unscored and excluded from the accuracy denominator. Both retain a fixed `invalid_reason` in score metadata. Local policy refusals and other unexpected exceptions propagate and fail the run visibly.
+Each task is valid only if the returned distribution covers exactly the label set, has numeric probabilities in `[0, 1]`, and sums to 1 within 2%. Distributions inside the 2% band are renormalized. Missing or invalid answers and HTTP server errors are scored incorrect: a returned 5xx cannot distinguish infrastructure failure from unusable model output. Only connect-phase errors or timeouts on every attempt, with no response or status ever received, are unscored and excluded from the accuracy denominator. Ambiguous failures (including read and pool timeouts) remain incorrect, and earlier HTTP failures retain their reason and status in metadata across retries. Scores always carry `invalid_reason` metadata. Local policy refusals and other unexpected exceptions propagate and fail the run visibly.
 
 Per-task score metadata includes:
 
