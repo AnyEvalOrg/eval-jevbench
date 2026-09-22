@@ -648,10 +648,68 @@ def test_model_catalog_is_cached_once_per_base_url():
     assert calls == [("https://cache.example/v1/models", "Bearer key-a")]
 
 
-def test_model_prefix_stripping():
-    assert _model_id_for_gateway("openai/trustedrouter/trev-1.0") == "trustedrouter/trev-1.0"
-    assert _model_id_for_gateway("trustedrouter/google/gemma-4-31b-it") == "google/gemma-4-31b-it"
-    assert _model_id_for_gateway("google/gemma-4-31b-it") == "google/gemma-4-31b-it"
+@pytest.mark.parametrize(
+    ("model_name", "gateway_id"),
+    [
+        ("openai/gpt-5.6-sol", "openai/gpt-5.6-sol"),
+        ("trustedrouter/trev-1.0", "trustedrouter/trev-1.0"),
+        ("trustedrouter/openai/gpt-5.6-sol", "openai/gpt-5.6-sol"),
+        ("openai/openai/gpt-5.6-sol", "openai/gpt-5.6-sol"),
+        ("openai/trustedrouter/trev-1.0", "trustedrouter/trev-1.0"),
+        ("trustedrouter/google/gemma-4-31b-it", "google/gemma-4-31b-it"),
+        ("google/gemma-4-31b-it", "google/gemma-4-31b-it"),
+        ("deepseek/deepseek-v3", "deepseek/deepseek-v3"),
+        # Inspect removes openai-api/; the remaining alias is a known limitation.
+        ("gateway/openai/gpt-5.6-sol", "gateway/openai/gpt-5.6-sol"),
+    ],
+)
+def test_model_prefix_stripping(model_name, gateway_id):
+    assert _model_id_for_gateway(model_name) == gateway_id
+
+
+def test_provider_request_hook_preserves_gateway_model_id(monkeypatch):
+    _MODEL_CATALOG_CACHE.clear()
+    sdk_httpx = _openai_sdk_httpx_module()
+    hook_calls = []
+    wire_calls = []
+
+    async def models_handler(request):
+        return httpx.Response(200, json={"data": []})
+
+    _mock_private_catalog(monkeypatch, models_handler)
+
+    async def hook(request):
+        body = json.loads(request.content)
+        hook_calls.append(body)
+        assert body["model"] == "openai/gpt-5.6-sol"
+
+    async def handler(request):
+        wire_calls.append(request)
+        return sdk_httpx.Response(200, json={"answers": {"decision": {"probability": 0.8}}})
+
+    provider_client = openai.AsyncOpenAI(
+        api_key="sdk-key",
+        base_url="https://sdk.example/v1",
+        http_client=sdk_httpx.AsyncClient(
+            transport=sdk_httpx.MockTransport(handler), event_hooks={"request": [hook]}
+        ),
+    )
+    try:
+        call = _gateway_decide(
+            state_value="state",
+            question={"type": "noul", "instructions": "Allowed?", "criteria": {"true": "yes", "false": "no"}},
+            labels=["no", "yes"],
+            model_id=_model_id_for_gateway("openai/gpt-5.6-sol"),
+            timeout_s=5,
+            provider_client=provider_client,
+        )
+        result = asyncio.run(call)
+        assert result.ok
+    finally:
+        asyncio.run(provider_client.close())
+
+    assert len(hook_calls) == 1
+    assert len(wire_calls) == 1
 
 
 @pytest.mark.live

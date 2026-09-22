@@ -22,6 +22,10 @@ DATA_FILES = {
     "easy": "easy.jsonl",
     "hard": "hard.jsonl",
 }
+# Denominator exclusions were withdrawn: a returned response can hide behind a
+# redirect, a body read, or a hook, so this layer cannot prove a call never
+# reached the model. The consumer that observes response delivery must make
+# that decision; every invalid reason here scores INCORRECT.
 INVALID_REASONS = {
     "missing_answer",
     "wrong_type",
@@ -210,10 +214,12 @@ def _translate_question(question: dict[str, Any], labels: list[str]) -> dict[str
 
 
 def _model_id_for_gateway(model_name: str) -> str:
-    if model_name.startswith("openai/"):
+    # Not a universal namespace conversion: Inspect's openai-api/gateway/openai/...
+    # leaves gateway/openai/... here, which AnyEval's model pin refuses (pre-existing).
+    # Both names can be Inspect providers OR gateway providers. Strip a prefix
+    # only when another provider segment remains, preserving provider/model ids.
+    if model_name.startswith("openai/") and "/" in model_name[len("openai/") :]:
         model_name = model_name[len("openai/") :]
-    # Treat trustedrouter/ as an Inspect provider prefix only when another
-    # provider id remains; trustedrouter/trev-1.0 is itself a gateway model id.
     if model_name.startswith("trustedrouter/") and "/" in model_name[len("trustedrouter/") :]:
         model_name = model_name[len("trustedrouter/") :]
     return model_name
