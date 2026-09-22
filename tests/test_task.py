@@ -136,7 +136,8 @@ def test_preset_invalid_reason_score_value_and_metadata(reason):
     )
     assert ANSWER_INVALID_REASONS.isdisjoint(HARNESS_INVALID_REASONS)
     assert score.metadata["invalid_reason"] == reason
-    if reason in HARNESS_INVALID_REASONS:
+    # Explicit expectations: changing the production sets must not change the test.
+    if reason in {"timeout", "transport_error"}:
         # AnyEval's _from_number classifies NaN as UNSCORED, while "N" is ABSTAINED.
         assert isinstance(score.value, float) and math.isnan(score.value)
         assert math.isnan(json.loads(score.model_dump_json())["value"])
@@ -155,6 +156,19 @@ def _assert_unscored_result(result, reason):
         preset_invalid_reason=result.invalid_reason,
     )
     assert isinstance(score.value, float) and math.isnan(score.value)
+    assert score.metadata["invalid_reason"] == reason
+
+
+def _assert_incorrect_result(result, reason):
+    score = _score_decision(
+        raw_probs=result.probs,
+        expected="yes",
+        labels=["no", "yes"],
+        question_type="noul",
+        preset_invalid_reason=result.invalid_reason,
+    )
+    assert score.value == "I"
+    assert score.metadata["correct"] is False
     assert score.metadata["invalid_reason"] == reason
 
 
@@ -472,12 +486,13 @@ def test_502_no_retry_scores_invalid_on_provider_client(monkeypatch):
     assert calls.count("/v1/decide") == 1
     assert result.ok is False
     assert result.invalid_reason == "http_502_no_retry"
-    _assert_unscored_result(result, "http_502_no_retry")
+    _assert_incorrect_result(result, "http_502_no_retry")
     assert result.probs_source == "native"
     assert result.transport == "provider_client"
 
 
-def test_sdk_httpx2_502_no_retry_scores_invalid_once_on_provider_client(monkeypatch):
+@pytest.mark.parametrize("usage", [{}, {"input_tokens": 10, "output_tokens": 20, "cost_microdollars": 50}])
+def test_sdk_httpx2_502_no_retry_scores_invalid_once_on_provider_client(monkeypatch, usage):
     _MODEL_CATALOG_CACHE.clear()
     sdk_httpx = _openai_sdk_httpx_module()
     calls = []
@@ -495,7 +510,7 @@ def test_sdk_httpx2_502_no_retry_scores_invalid_once_on_provider_client(monkeypa
         return sdk_httpx.Response(
             502,
             headers={"x-should-retry": "false"},
-            json={"model": "trustedrouter/trev-1.0"},
+            json={"model": "trustedrouter/trev-1.0", "usage": usage},
         )
 
     provider_client = _sdk_provider_client(sdk_httpx, handler)
@@ -516,7 +531,7 @@ def test_sdk_httpx2_502_no_retry_scores_invalid_once_on_provider_client(monkeypa
     assert calls.count("/v1/decide") == 1
     assert result.ok is False
     assert result.invalid_reason == "http_502_no_retry"
-    _assert_unscored_result(result, "http_502_no_retry")
+    _assert_incorrect_result(result, "http_502_no_retry")
     assert result.probs_source == "native"
     assert result.transport == "provider_client"
 
@@ -556,7 +571,7 @@ def test_sdk_httpx2_500_retries_then_scores_http_5xx_on_provider_client(monkeypa
     assert calls.count("/v1/decide") == 3
     assert result.ok is False
     assert result.invalid_reason == "http_5xx"
-    _assert_unscored_result(result, "http_5xx")
+    _assert_incorrect_result(result, "http_5xx")
     assert result.probs_source == "native"
 
 
@@ -699,6 +714,8 @@ def test_model_catalog_is_cached_once_per_base_url():
         ("trustedrouter/google/gemma-4-31b-it", "google/gemma-4-31b-it"),
         ("google/gemma-4-31b-it", "google/gemma-4-31b-it"),
         ("deepseek/deepseek-v3", "deepseek/deepseek-v3"),
+        # Inspect removes openai-api/; the remaining alias is a known limitation.
+        ("gateway/openai/gpt-5.6-sol", "gateway/openai/gpt-5.6-sol"),
     ],
 )
 def test_model_prefix_stripping(model_name, gateway_id):
@@ -744,22 +761,86 @@ def test_provider_request_hook_before_wire(monkeypatch, hook_error):
             timeout_s=5,
             provider_client=provider_client,
         )
-        if hook_error == "hook bug":
+        if hook_error:
             with pytest.raises(openai.APIConnectionError) as caught:
                 asyncio.run(call)
             assert isinstance(caught.value.__cause__, ValueError)
             assert str(caught.value.__cause__) == hook_error
         else:
             result = asyncio.run(call)
-            if hook_error:
-                _assert_unscored_result(result, "request_refused_locally")
-            else:
-                assert result.ok
+            assert result.ok
     finally:
         asyncio.run(provider_client.close())
 
     assert len(hook_calls) == 1
     assert len(wire_calls) == (0 if hook_error else 1)
+
+
+@pytest.mark.parametrize("provider", [False, True])
+def test_response_hook_refusal_text_after_real_wire_call_propagates(monkeypatch, provider):
+    _MODEL_CATALOG_CACHE.clear()
+    http = _openai_sdk_httpx_module() if provider else httpx
+    wire_calls = []
+    hook_calls = []
+    hook_error = ValueError("model is not authorized for this trial")
+    payload = {"answers": {"decision": {"probability": 0.8}}, "usage": {"output_tokens": 20}}
+
+    async def serve(reader, writer):
+        headers = (await reader.readuntil(b"\r\n\r\n")).decode()
+        size = next(int(line.split(":", 1)[1]) for line in headers.split("\r\n")
+                    if line.lower().startswith("content-length:"))
+        wire_calls.append(json.loads(await reader.readexactly(size)))
+        body = json.dumps(payload).encode()
+        writer.write(
+            f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode()
+            + body
+        )
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+
+    async def hook(response):
+        await response.aread()
+        assert response.status_code == 200
+        hook_calls.append(response.json())
+        raise hook_error
+
+    async def run():
+        server = await asyncio.start_server(serve, "127.0.0.1", 0)
+        async with server:
+            base_url = f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}/v1"
+            _MODEL_CATALOG_CACHE[base_url] = {}
+            client = http.AsyncClient(event_hooks={"response": [hook]})
+            try:
+                if provider:
+                    gateway_client = openai.AsyncOpenAI(
+                        api_key="test-key", base_url=base_url, http_client=client,
+                    )
+                else:
+                    gateway_client = None
+                    monkeypatch.setattr(task_module.httpx, "AsyncClient", lambda **kwargs: client)
+                try:
+                    with pytest.raises(openai.APIConnectionError if provider else ValueError) as caught:
+                        await _gateway_decide(
+                            state_value="state",
+                            question={"type": "noul", "instructions": "Allowed?"},
+                            labels=["no", "yes"],
+                            model_id="openai/gpt-5.6-sol",
+                            timeout_s=5,
+                            base_url=base_url,
+                            api_key="test-key",
+                            provider_client=gateway_client,
+                        )
+                    assert (caught.value.__cause__ if provider else caught.value) is hook_error
+                finally:
+                    if gateway_client is not None:
+                        await gateway_client.close()
+            finally:
+                await client.aclose()
+
+    asyncio.run(run())
+    assert len(wire_calls) == 1
+    assert hook_calls == [payload]
 
 
 @pytest.mark.parametrize("provider", [False, True])

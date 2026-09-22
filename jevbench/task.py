@@ -28,13 +28,15 @@ ANSWER_INVALID_REASONS = {
     "label_set_mismatch",
     "out_of_range",
     "sum_out_of_band",
-}
-HARNESS_INVALID_REASONS = {
     "http_502_no_retry",
     "http_5xx",
+}
+# Only failures with no gateway response may leave the denominator. A returned
+# 5xx (even with usage or x-should-retry: false) cannot distinguish infrastructure
+# failure from unusable model output; billing proves neither. Keep it INCORRECT.
+HARNESS_INVALID_REASONS = {
     "timeout",
     "transport_error",
-    "request_refused_locally",
 }
 INVALID_REASONS = ANSWER_INVALID_REASONS | HARNESS_INVALID_REASONS
 _MODEL_CATALOG_CACHE: dict[str, dict[str, str]] = {}
@@ -215,6 +217,8 @@ def _translate_question(question: dict[str, Any], labels: list[str]) -> dict[str
 
 
 def _model_id_for_gateway(model_name: str) -> str:
+    # Not a universal namespace conversion: Inspect's openai-api/gateway/openai/...
+    # leaves gateway/openai/... here, which AnyEval's model pin refuses (pre-existing).
     # Both names can be Inspect providers OR gateway providers. Strip a prefix
     # only when another provider segment remains, preserving provider/model ids.
     if model_name.startswith("openai/") and "/" in model_name[len("openai/") :]:
@@ -294,16 +298,15 @@ def _is_sdk_transport_error(exc: BaseException) -> bool:
 
 
 def _transport_invalid_reason(exc: BaseException) -> str | None:
-    # The SDK wraps request-hook exceptions as connection errors, even before
-    # the wire. Inspect the cause so local refusals and bugs aren't timeouts.
+    # The SDK also wraps hook bugs as connection errors. Inspect the cause.
+    # AnyEval's policy refusal is a plain ValueError with no provenance marker;
+    # let it propagate, since its message could also come from a response hook.
     if _is_sdk_transport_error(exc):
         if exc.__cause__ is not None:
             return _transport_invalid_reason(exc.__cause__)
         import openai
 
         return "timeout" if isinstance(exc, openai.APITimeoutError) else "transport_error"
-    if isinstance(exc, (ValueError, PermissionError, RuntimeError)) and "model is not authorized for this trial" in str(exc):
-        return "request_refused_locally"
     # SDK 3.x uses httpx2; private requests still use httpx.
     for package in ("httpx", "httpx2"):
         try:
@@ -456,7 +459,7 @@ async def _gateway_decide(
                     invalid_reason = _transport_invalid_reason(exc)
                     if invalid_reason is None:
                         raise
-                    if invalid_reason != "request_refused_locally" and attempt < 2:
+                    if attempt < 2:
                         await asyncio.sleep(0.25 * (2**attempt))
                         continue
                     return DecisionResult(False, None, "unknown", {}, time.perf_counter() - t0, model_id, transport_name, invalid_reason)
@@ -464,6 +467,8 @@ async def _gateway_decide(
             last_status = response.status_code
             if last_status in {400, 401, 402, 403}:
                 response.raise_for_status()
+            # Pre-existing: only 502 honors no-retry; a usage-bearing 503 with
+            # x-should-retry: false still makes three attempts. Out of scope here.
             if last_status == 502 and _header_value(response.headers, "x-should-retry").lower() == "false":
                 served_model = _served_model(response, model_id)
                 return DecisionResult(False, None, _probs_source(modalities, served_model), {}, time.perf_counter() - t0, served_model, transport_name, "http_502_no_retry")
