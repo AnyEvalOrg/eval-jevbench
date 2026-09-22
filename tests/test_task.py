@@ -2,11 +2,13 @@ import json
 import os
 import asyncio
 import importlib
+from types import SimpleNamespace
 
 import httpx
 import openai
 import pytest
 from inspect_ai import eval
+from inspect_ai.scorer import Target
 
 import jevbench.task as task_module
 from jevbench.task import (
@@ -211,6 +213,100 @@ def _sdk_provider_client(sdk_httpx, handler):
     assert type(provider_client._client) is type(http_client)
     assert isinstance(provider_client._client, sdk_httpx.AsyncClient)
     return provider_client
+
+
+@pytest.mark.parametrize("task_name", ["jevbench", "jevbench_easy", "jevbench_hard", "jevbench_original"])
+@pytest.mark.parametrize("transport_name", ["provider_client", "private_client"])
+@pytest.mark.parametrize(
+    ("task_args", "wire_reasoning", "normalized"),
+    [
+        ({}, None, None),
+        ({"reasoning": None}, None, None),
+        ({"reasoning": True}, True, True),
+        ({"reasoning": "low"}, {"effort": "low"}, "low"),
+        ({"reasoning": "medium"}, {"effort": "medium"}, "medium"),
+        ({"reasoning": "high"}, {"effort": "high"}, "high"),
+    ],
+)
+def test_task_reasoning_request_and_score_metadata(
+    monkeypatch, task_name, transport_name, task_args, wire_reasoning, normalized
+):
+    _MODEL_CATALOG_CACHE.clear()
+    bodies = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/models":
+            return httpx.Response(200, json={"data": []})
+        assert request.method == "POST"
+        assert request.url.path == "/v1/decide"
+        bodies.append(json.loads(request.content))
+        return httpx.Response(200, json={
+            "model": "test/model",
+            "answers": {"decision": {"probability": 0.75}},
+        })
+
+    class MockClient(httpx.AsyncClient):
+        def __init__(self, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(handler)
+            super().__init__(**kwargs)
+
+    monkeypatch.setattr(task_module.httpx, "AsyncClient", MockClient)
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://mock.example/v1")
+    monkeypatch.setenv("OPENAI_API_KEY", "mock-key")
+    provider_client = openai.AsyncOpenAI(
+        api_key="mock-key", base_url="https://mock.example/v1", http_client=MockClient()
+    ) if transport_name == "provider_client" else None
+    model = FakeModel(provider_client)
+    model.name = "openai/test/model"
+    monkeypatch.setattr(task_module, "get_model", lambda: model)
+    task = getattr(task_module, task_name)(**task_args)
+    state = SimpleNamespace(metadata={
+        "state": "state",
+        "question": {"type": "noul", "instructions": "Allowed?"},
+        "labels": ["no", "yes"],
+        "question_type": "noul",
+    }, completed=False)
+
+    async def run():
+        try:
+            await task.solver(state, None)
+            return await task.scorer[0](state, Target("yes"))
+        finally:
+            if provider_client is not None:
+                await provider_client.close()
+
+    score = asyncio.run(run())
+    expected_body = {
+        "state": "state",
+        "model": "test/model",
+        "questions": {"decision": {"type": "boolean", "instructions": "Allowed?"}},
+    }
+    if wire_reasoning is not None:
+        expected_body["reasoning"] = wire_reasoning
+    assert bodies == [expected_body]
+    if normalized is None:
+        assert "reasoning" not in bodies[0]
+    elif normalized is True:
+        assert bodies[0]["reasoning"] is True
+    assert score.value == "C"
+    assert state.completed is True
+    assert "reasoning" in score.metadata
+    assert score.metadata["reasoning"] == normalized
+    assert type(score.metadata["reasoning"]) is type(normalized)
+    assert score.metadata["probs_source"] == "unknown"
+    assert score.metadata["served_model"] == "test/model"
+    assert score.metadata["transport"] == transport_name
+
+
+@pytest.mark.parametrize("factory_name", [
+    "trustedrouter_decision_solver", "jevbench", "jevbench_easy", "jevbench_hard", "jevbench_original",
+])
+@pytest.mark.parametrize("reasoning", [
+    False, 0, 1, 1.0, "", "true", "false", "High", "hihg", "none", {}, {"effort": "high"}, [], ["high"],
+])
+def test_invalid_reasoning_raises_at_construction(factory_name, reasoning):
+    with pytest.raises(ValueError, match='reasoning must be None, True, or one of "low", "medium", "high"'):
+        getattr(task_module, factory_name)(reasoning=reasoning)
 
 
 def test_provider_client_decide_uses_sdk_base_auth_and_hooks(monkeypatch):
